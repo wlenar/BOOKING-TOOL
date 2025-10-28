@@ -1471,4 +1471,10 @@ if (String(process.env.ENABLE_CRON_CLEANUP_SLOTS || 'true').toLowerCase() === 't
    ========================= */
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => console.log(`Webhook listening on :${PORT}`));
+// proste zdrowie usługi (Render sprawdza to cyklicznie)
+app.get('/health', (req, res) => res.status(200).send('ok'));
+
+// ważne: jawnie nasłuchuj na 0.0.0.0 (zewnętrzny interfejs kontenera)
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Webhook listening on :${PORT}`);
+});
