@@ -1,2 +1,27 @@
+# Node / general
 node_modules/
+npm-debug.log*
+yarn-error.log*
+dist/
+build/
+.tmp/
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
+*.env
+*.key
+*.pem
+
+# OS / IDE
+.vscode/
+.idea/
+*.iml
+
+# Zbędne artefakty w tym repo
+ngrok-*.zip
+MVP/
+frontend/src/Summary,Issue Type,Description,Prio.txtnode_modules/
 .env
