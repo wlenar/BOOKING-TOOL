@@ -1442,7 +1442,7 @@ async function broadcastFreeSlotsTemplateThenList(client, phoneNumberIdOverride 
 }
 
 if (ENABLE_CRON_BROADCAST) {
-  // Sobota 16:00 – prośba o zgłoszenie nieobecności
+  // ✅ Sobota 16:00 – prośba o zgłoszenie nieobecności
   cron.schedule('0 16 * * 6', async () => {
     const client = await pool.connect();
     try {
@@ -1450,22 +1450,6 @@ if (ENABLE_CRON_BROADCAST) {
       await broadcastAskAbsencesTemplate(client, null);
     } catch (e) {
       console.error('[CRON ask-absences tmpl ERROR]', e);
-    } finally {
-      client.release();
-    }
-  }, { timezone: CRON_TZ });
-
-  // harmonogram: niedziela 15:00 (Europe/Warsaw)
-  cron.schedule('0 15 * * 0', ensureWeeklyOpenSlots, { timezone: 'Europe/Warsaw' });
-
-  // Niedziela 16:00 – intro (template) + lista free-form
-  cron.schedule('0 16 * * 0', async () => {
-    const client = await pool.connect();
-    try {
-      console.log('[CRON] niedziela 16:00 → free-slots (template + list)');
-      await broadcastFreeSlotsTemplateThenList(client, null);
-    } catch (e) {
-      console.error('[CRON free-slots tmpl ERROR]', e);
     } finally {
       client.release();
     }
