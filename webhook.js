@@ -45,7 +45,10 @@ const BROADCAST_BATCH_SLEEP_MS = Math.max(0, Number(process.env.BROADCAST_BATCH_
 
 const pool = new Pool(
   process.env.DATABASE_URL
-    ? { connectionString: process.env.DATABASE_URL }
+    ? {
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }   // << wymagane na Render
+      }
     : {
         user: process.env.DB_USER || 'booking_user',
         host: process.env.DB_HOST || 'localhost',
