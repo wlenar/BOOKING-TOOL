@@ -881,14 +881,25 @@ async function reserveOpenSlot(client, { user_id, class_template_id, session_dat
 }
 
 // wszyscy z numerem E.164 (rozważ dodać kolumnę users.is_opted_in = true i filtrować)
+// 📋 Lista aktywnych użytkowników z numerem i imieniem
 async function getAllRecipients(client) {
   const sql = `
-    SELECT id AS user_id, phone_e164 AS e164
+    SELECT 
+      id AS user_id,
+      phone_e164 AS e164,
+      first_name
     FROM public.users
-    WHERE phone_e164 IS NOT NULL
+    WHERE 
+      phone_e164 IS NOT NULL
+      AND is_active = true
   `;
   const { rows } = await client.query(sql);
-  return rows.map(r => ({ to: String(r.e164).replace(/^\+/, ''), user_id: r.user_id }));
+
+  return rows.map(r => ({
+    to: String(r.e164).replace(/^\+/, ''),
+    user_id: r.user_id,
+    first_name: r.first_name
+  }));
 }
 
 // stworzenie wolnych slotów wynikających z wolnych miejsc na grupach (brak zapisanych na stale uzytkowników)
