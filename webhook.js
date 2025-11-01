@@ -26,7 +26,7 @@ app.use(express.json({
 /* =========================
    ENV / KONFIG
    ========================= */
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'Mariposa1$';
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const APP_SECRET = process.env.APP_SECRET || '';
 
 const WA_TOKEN     = process.env.WHATSAPP_TOKEN || null;
@@ -1026,7 +1026,12 @@ app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('Webhook verified');
+    return res.status(200).send(challenge);
+  }
+  console.warn('Webhook verify failed:', { mode, tokenOk: token === VERIFY_TOKEN });
   return res.sendStatus(403);
 });
 
