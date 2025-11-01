@@ -1336,25 +1336,45 @@ app.post('/webhook', async (req, res) => {
 /* =========================
    CRON – sobota/niedziela z SZABLONAMI
    ========================= */
+// 🔔 Sobota 16:00 – wysyłka szablonu "absence_reminder"
 async function broadcastAskAbsencesTemplate(client, phoneNumberIdOverride = null) {
   const recipients = await getAllRecipients(client);
   if (!recipients.length) {
     console.log('[BROADCAST] ask-absences (tmpl): brak odbiorców');
     return;
   }
-  if (!TEMPLATE_ABSENCE_REMINDER) {
-    console.warn('[BROADCAST] brak TEMPLATE_ABSENCE_REMINDER w ENV');
-    return;
-  }
-  console.log(`[BROADCAST] ask-absences (tmpl) → ${recipients.length} osób`);
+
+  // Nazwa szablonu z ENV
+  const templateName = process.env.TEMPLATE_ABSENCE_REMINDER || 'absence_reminder';
+  console.log(`[BROADCAST] ask-absences (tmpl) → ${recipients.length} osób, template=${templateName}`);
+
   for (const r of recipients) {
-    await sendTemplate({
-      to: r.to,
-      templateName: TEMPLATE_ABSENCE_REMINDER,
-      components: [], // bez zmiennych w treści
-      phoneNumberId: phoneNumberIdOverride
-    });
-    await pause(BROADCAST_BATCH_SLEEP_MS);
+    // spróbuj wydobyć imię z obiektu użytkownika
+    const firstName =
+      r.first_name ||
+      r.firstName ||
+      (r.name ? String(r.name).split(/\s+/)[0] : null) ||
+      (r.full_name ? String(r.full_name).split(/\s+/)[0] : null) ||
+      'Cześć';
+
+    try {
+      await sendTemplate({
+        to: r.to,
+        templateName: templateName,
+        components: [
+          {
+            type: 'body',
+            parameters: [{ type: 'text', text: firstName }]
+          }
+        ],
+        phoneNumberId: phoneNumberIdOverride
+      });
+
+      console.log(`[BROADCAST] absence_reminder → ${r.to} (${firstName})`);
+      await pause(BROADCAST_BATCH_SLEEP_MS);
+    } catch (e) {
+      console.error(`[BROADCAST ERROR] absence_reminder → ${r.to}`, e.message);
+    }
   }
 }
 
