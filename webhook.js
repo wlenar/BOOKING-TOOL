@@ -17,7 +17,6 @@ app.use((req, res, next) => {
   });
 })
 app.use(express.json({
-  limit: '1mb',
   verify: (req, res, buf) => {
     // jeśli rawBody nie złapał się wyżej, złap tu
     if (!req.rawBody) req.rawBody = Buffer.from(buf);
@@ -28,15 +27,14 @@ app.use(express.json({
    ENV / KONFIG
    ========================= */
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const APP_SECRET = process.env.APP_SECRET || null;
+const APP_SECRET = process.env.APP_SECRET || '';
 
-const WA_TOKEN     = process.env.WHATSAPP_TOKEN || process.env.META_TOKEN || null;
-const WA_PHONE_ID  = process.env.WHATSAPP_PHONE_NUMBER_ID || process.env.PHONE_NUMBER_ID || null;
+const WA_TOKEN     = process.env.WHATSAPP_TOKEN || null;
+const WA_PHONE_ID  = process.env.WHATSAPP_PHONE_NUMBER_ID || null;
 
 const TEMPLATE_LANG               = process.env.TEMPLATE_LANG || 'pl';
 const TEMPLATE_ABSENCE_REMINDER  = process.env.TEMPLATE_ABSENCE_REMINDER || null;   // np. booking_absence_reminder_pl
 const TEMPLATE_WEEKLY_SLOTS_INTRO = process.env.TEMPLATE_WEEKLY_SLOTS_INTRO || null; // np. booking_free_slots_intro_pl
-const DEBUG_WEBHOOK = String(process.env.DEBUG_WEBHOOK || 'false').toLowerCase() === 'true';
 
 const OUTBOUND_MAX_RETRIES  = Math.max(0, Number(process.env.OUTBOUND_MAX_RETRIES ?? 3));
 const OUTBOUND_RETRY_BASE_MS= Math.max(100, Number(process.env.OUTBOUND_RETRY_BASE_MS ?? 800));
@@ -1052,31 +1050,14 @@ app.get('/webhook', (req, res) => {
 });
 
 // (opcjonalnie) podpis X-Hub-Signature-256
-function verifyMetaSignature(req, res, next) {
-  if (!APP_SECRET) return res.status(500).send('APP_SECRET not configured');
-
-  const sig = req.get('x-hub-signature-256'); // nagłówki są case-insensitive
-  if (!sig || !req.rawBody) return res.status(401).send('Missing signature');
-
-  const expected = 'sha256=' + crypto
-    .createHmac('sha256', APP_SECRET)
-    .update(req.rawBody)           // surowy payload, nie JSON.stringify
-    .digest('hex');
-
-  const a = Buffer.from(sig, 'utf8');
-  const b = Buffer.from(expected, 'utf8');
-  if (a.length !== b.length) return res.status(401).send('Bad signature');
-
-  try {
-    if (!crypto.timingSafeEqual(a, b)) return res.status(401).send('Bad signature');
-  } catch {
-    return res.status(401).send('Bad signature');
-  }
-  return next();
+function verifyMetaSignature(req) {
+  if (!APP_SECRET) return true;
+  const sig = req.get('X-Hub-Signature-256');
+  if (!sig) return false;
+  const hmac = crypto.createHmac('sha256', APP_SECRET);
+  const digest = 'sha256=' + hmac.update(JSON.stringify(req.body)).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig));
 }
-
-// i użycie:
-app.post('/webhook', verifyMetaSignature, async (req, res) => { /* ... */ });
 
 app.post('/webhook', async (req, res) => {
   // (opcjonalnie) wymuś podpis, jeśli APP_SECRET jest ustawiony
@@ -1107,13 +1088,8 @@ app.post('/webhook', async (req, res) => {
     return res.status(403).send('Bad signature');
   }
 }
-  if (DEBUG_WEBHOOK) {
-   console.log('[WEBHOOK HIT]', {
-      sig: req.get('x-hub-signature-256'),
-      rawLen: req.rawBody?.length || 0,
-      hasEntryArray: Array.isArray(req.body?.entry)
-    });
-  }
+  console.log('[WEBHOOK HIT] headers.x-hub-signature-256=', req.get('x-hub-signature-256'));
+  console.log('[WEBHOOK HIT] rawBody.len=', req.rawBody?.length, ' bodyIsArrayEntry=', Array.isArray(req.body?.entry));
 
   let body;
   try {
@@ -1129,9 +1105,7 @@ app.post('/webhook', async (req, res) => {
     return res.status(400).send('Bad JSON');
   }
 
-  if (DEBUG_WEBHOOK) {
-  console.log('[WEBHOOK BODY PREVIEW]', typeof body, { keys: Object.keys(body || {}) });
-  }
+  console.log('[WEBHOOK BODY PREVIEW]', typeof body, 'keys=', Object.keys(body || {}));
 
   if (!body || !Array.isArray(body.entry)) {
     console.log('[WEBHOOK] brak entry[] → 200');
@@ -1148,12 +1122,7 @@ app.post('/webhook', async (req, res) => {
         const v = ch?.value || {};
         const phoneNumberIdFromHook = v?.metadata?.phone_number_id || null;
         
-        if (DEBUG_WEBHOOK) {
-          console.log('[WEBHOOK CHANGE]', {
-            hasMessagesArray: Array.isArray(v.messages),
-            hasStatusesArray: Array.isArray(v.statuses)
-          });
-        }
+        console.log('[WEBHOOK CHANGE]', 'hasMessagesArray=', Array.isArray(v.messages), 'hasStatusesArray=', Array.isArray(v.statuses));
 
         // messages
         if (Array.isArray(v.messages)) {
