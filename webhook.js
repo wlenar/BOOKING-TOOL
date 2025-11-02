@@ -36,8 +36,8 @@ const TEMPLATE_LANG               = process.env.TEMPLATE_LANG || 'pl';
 const TEMPLATE_ABSENCE_REMINDER  = process.env.TEMPLATE_ABSENCE_REMINDER || null;   // np. booking_absence_reminder_pl
 const TEMPLATE_WEEKLY_SLOTS_INTRO = process.env.TEMPLATE_WEEKLY_SLOTS_INTRO || null; // np. booking_free_slots_intro_pl
 
-const OUTBOUND_MAX_RETRIES  = Math.max(0, Number(process.env.OUTBOUND_MAX_RETRIES ?? 3));
-const OUTBOUND_RETRY_BASE_MS= Math.max(100, Number(process.env.OUTBOUND_RETRY_BASE_MS ?? 800));
+const OUTBOUND_MAX_RETRIES   = Math.max(0, Number(process.env.OUTBOUND_MAX_RETRIES ?? 3));
+const OUTBOUND_RETRY_BASE_MS = Math.max(100, Number(process.env.OUTBOUND_RETRY_BASE_MS ?? 800));
 
 const ENABLE_CRON_BROADCAST = String(process.env.ENABLE_CRON_BROADCAST || 'true').toLowerCase() === 'true';
 const CRON_TZ               = process.env.CRON_TZ || 'Europe/Warsaw';
@@ -217,7 +217,7 @@ function parseDateTime(text) {
 
   // --- "do 20 pazdziernika" (gen.)  → zakres od dziś do wskazanej daty (włącznie)
   {
-    const mName = t.match(/\bdo\s+(\d{1,2})\s+(stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|wrzesnia|pazdziernika|listopada|grudnia)(?:\s+(\d{4}))?\b/);
+    const mName = t.match(/\bdo\s+(\d{1,2})\s+(stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|wrzesnia|pazdziernika|listopada)(?:\s+(\d{4}))?\b/);
     if (mName) {
       const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
       const dd = parseInt(mName[1],10), mm = MONTHS_GEN[mName[2]];
@@ -744,8 +744,9 @@ async function insertAbsenceIfPossible(client, candidate, fromWaId) {
     });
   }
 
-  if (!userId) return { inserted: false, reason: 'missing_user_mapping', fromWaId };
-  if (!candidate?.session_date) return { inserted: false, reason: 'missing_session_date' };
+  if (!candidate?.session_date && !(candidate.date_from && candidate.date_to)) {
+    return { inserted: false, reason: 'missing_session_date' };
+  }
 
   const r = await resolveClassTemplateIdForAbsence(client, {
     user_id: userId,
@@ -782,14 +783,9 @@ async function insertAbsenceIfPossible(client, candidate, fromWaId) {
 async function reserveOpenSlot(client, { user_id, class_template_id, session_date, session_time }) {
   await client.query('BEGIN');
   try {
-    // 1) Odczytaj otwarte sloty na daną datę w ramach danego class_template,
-    //    razem z godziną z class_templates.start_time (alias jako session_time).
-    //    UWAGA: nie odwołujemy się nigdzie do slots.session_time – takiej kolumny nie ma.
     let res;
 
     if (session_time) {
-      // Mamy godzinę → filtruj po start_time
-      // Załóżmy, że upstream podaje "HH:MM" (ew. możesz tu jeszcze ustandaryzować input).
       res = await client.query(
         `
           SELECT s.id
@@ -809,10 +805,9 @@ async function reserveOpenSlot(client, { user_id, class_template_id, session_dat
 
       if (res.rowCount === 0) {
         await client.query('ROLLBACK');
-        return { ok: false, reason: 'no_slot_for_time' }; // brak slotu o podanej godzinie
+        return { ok: false, reason: 'no_slot_for_time' };
       }
     } else {
-      // Brak godziny → sprawdź, ile jest otwartych slotów w tym dniu
       const allOpen = await client.query(
         `
           SELECT s.id, ct.start_time AS session_time
@@ -834,16 +829,14 @@ async function reserveOpenSlot(client, { user_id, class_template_id, session_dat
       }
       if (allOpen.rowCount > 1) {
         await client.query('ROLLBACK');
-        return { ok: false, reason: 'ambiguous_day_requires_time' }; // jest kilka slotów – trzeba podać godzinę
+        return { ok: false, reason: 'ambiguous_day_requires_time' };
       }
 
-      // Dokładnie jeden otwarty slot → rezerwujemy ten
       res = { rowCount: 1, rows: [ { id: allOpen.rows[0].id } ] };
     }
 
     const slotId = res.rows[0].id;
 
-    // 2) Zapobiegnij duplikatom rezerwacji użytkownika w tym dniu/CT
     const dup = await client.query(
       `
         SELECT 1
@@ -861,7 +854,6 @@ async function reserveOpenSlot(client, { user_id, class_template_id, session_dat
       return { ok: true, slot_id: slotId, via: 'already_taken_by_user' };
     }
 
-    // 3) Zajmij slot (wyścig zabezpieczony FOR UPDATE SKIP LOCKED + status check)
     const upd = await client.query(
       `
         UPDATE public.slots
@@ -888,7 +880,6 @@ async function reserveOpenSlot(client, { user_id, class_template_id, session_dat
   }
 }
 
-// wszyscy z numerem E.164 (rozważ dodać kolumnę users.is_opted_in = true i filtrować)
 // 📋 Lista aktywnych użytkowników z numerem i imieniem
 async function getAllRecipients(client) {
   const sql = `
@@ -910,13 +901,13 @@ async function getAllRecipients(client) {
   }));
 }
 
-// stworzenie wolnych slotów wynikających z wolnych miejsc na grupach (brak zapisanych na stale uzytkowników)
+// stworzenie wolnych slotów wynikających z wolnych miejsc na grupach
 async function ensureWeeklyOpenSlots() {
   const client = await pool.connect();
   try {
     const sql = `
       WITH dates AS (
-        SELECT (CURRENT_DATE + i) AS d FROM generate_series(1,7) AS i  -- najbliższy tydzień (pon–nd)
+        SELECT (CURRENT_DATE + i) AS d FROM generate_series(1,7) AS i
       ),
       ct AS (
         SELECT ct.id AS class_template_id, ct.weekday_iso, g.max_capacity AS capacity
@@ -987,9 +978,7 @@ async function getOpenSlotsNextWeek(client) {
   return rows;
 }
 
-// Tworzy sloty na horyzoncie [jutro .. dziś + daysAhead] (domyślnie 14 dni)
-// Idempotentnie: nie tworzy duplikatów istniejących (class_template_id + session_date)
-// Tworzy open-sloty tylko gdy są wolne miejsca (capacity > enrollments)
+// Tworzy sloty na horyzoncie N dni (domyślnie 14)
 async function createSlotsForRollingHorizon(client, daysAhead = 14) {
   const sql = `
     WITH horizon AS (
@@ -1014,8 +1003,8 @@ async function createSlotsForRollingHorizon(client, daysAhead = 14) {
       SELECT c.class_template_id, h.d AS session_date
       FROM horizon h
       JOIN cap c ON c.weekday_iso = EXTRACT(ISODOW FROM h.d)::int
-      WHERE (c.capacity - c.enrolled) > 0                              -- jest wolne miejsce
-        AND NOT EXISTS (                                               -- brak jakiegokolwiek slota na ten dzień
+      WHERE (c.capacity - c.enrolled) > 0
+        AND NOT EXISTS (
           SELECT 1 FROM public.slots s
            WHERE s.class_template_id = c.class_template_id
              AND s.session_date      = h.d
@@ -1043,7 +1032,7 @@ async function cleanupOpenSlots(client, retainDays = 60) {
 
 async function sendUnrecognizedAck({ to, phoneNumberId = null, idempotencyKey = null }) {
   const body = '📩 Otrzymaliśmy Twoją wiadomość. Nie potrafię jej automatycznie zinterpretować — przekażę ją do administratora.';
-  return sendText({ to, body, phoneNumberId });
+  return sendText({ to, body, phoneNumberId, idempotencyKey });
 }
 
 /* =========================
@@ -1078,29 +1067,16 @@ app.post('/webhook', async (req, res) => {
     const sigHeader = req.get('x-hub-signature-256') || '';
     const [prefix, sigHex] = sigHeader.split('=');
 
-    // podstawowe sanity checks
-    if (prefix !== 'sha256' || !sigHex) {
-      return res.status(403).send('Missing signature');
-    }
-    // policz oczekiwany podpis
-    const expectedHex = crypto
-      .createHmac('sha256', APP_SECRET)
-      .update(req.rawBody || Buffer.from([]))
-      .digest('hex');
+    if (prefix !== 'sha256' || !sigHex) return res.status(403).send('Missing signature');
 
-    // porównujemy BAJTY (hex -> Buffer)
+    const expectedHex = crypto.createHmac('sha256', APP_SECRET).update(req.rawBody || Buffer.from([])).digest('hex');
     const a = Buffer.from(sigHex, 'hex');
     const b = Buffer.from(expectedHex, 'hex');
-
-    // zanim użyjemy timingSafeEqual, długości muszą się zgadzać
-    if (a.length !== b.length) {
-      return res.status(403).send('Bad signature');
-    }
+    if (a.length !== b.length) return res.status(403).send('Bad signature');
     const ok = crypto.timingSafeEqual(a, b);
-    if (!ok) {
-      return res.status(403).send('Bad signature');
-    }
+    if (!ok) return res.status(403).send('Bad signature');
   }
+
   console.log('[WEBHOOK HIT] headers.x-hub-signature-256=', req.get('x-hub-signature-256'));
   console.log('[WEBHOOK HIT] rawBody.len=', req.rawBody?.length, ' bodyIsArrayEntry=', Array.isArray(req.body?.entry));
 
@@ -1149,6 +1125,20 @@ app.post('/webhook', async (req, res) => {
 
             const canReplyNow = within24h(rec.sent_ts);
 
+            // guard: nieznany użytkownik → grzeczny komunikat i koniec
+            const knownUserId = await resolveUserIdByWa(client, rec.from_wa_id);
+            if (!knownUserId) {
+              if (canReplyNow) {
+                await sendText({
+                  to: rec.from_wa_id,
+                  body: '📩 Otrzymaliśmy Twoją wiadomość, ale ten numer nie jest przypisany do żadnego uczestnika. Skontaktuj się z administratorem, aby dodać numer do systemu.',
+                  phoneNumberId: phoneNumberIdFromHook,
+                  idempotencyKey: `${rec.provider_message_id}:unknown_user`
+                });
+              }
+              continue;
+            }
+
             // REZERWACJA
             if (isReservationIntent(text)) {
               const { session_date, session_time } = parseDateTime(text);
@@ -1156,19 +1146,13 @@ app.post('/webhook', async (req, res) => {
                 if (canReplyNow) await sendText({
                   to: rec.from_wa_id,
                   body: '❔ Podaj proszę datę (np. 21.09) i ewentualnie godzinę (np. 19:00), żebym mógł zapisać Cię na zajęcia.',
-                  phoneNumberId: phoneNumberIdFromHook
+                  phoneNumberId: phoneNumberIdFromHook,
+                  idempotencyKey: `${rec.provider_message_id}:ask_date_time`
                 });
                 continue;
               }
-              const userId = await resolveUserIdByWa(client, rec.from_wa_id);
-              if (!userId) {
-                if (canReplyNow) await sendText({
-                  to: rec.from_wa_id,
-                  body: '❗ Nie rozpoznaję Twojego numeru w systemie. Daj znać recepcji, aby Cię dodać.',
-                  phoneNumberId: phoneNumberIdFromHook
-                });
-                continue;
-              }
+
+              const userId = knownUserId; // już rozpoznany
               let cls;
               if (session_time) {
                 const ctByTime = await client.query(`
@@ -1185,13 +1169,12 @@ app.post('/webhook', async (req, res) => {
                 } else if (ctByTime.rowCount > 1) {
                   cls = { ok: false, reason: 'ambiguous_by_time' };
                 } else {
-                  // brak klasy o tej godzinie – fallback do dotychczasowej logiki po dniu
                   cls = await resolveClassTemplateIdBySlot(client, session_date);
                 }
               } else {
                 cls = await resolveClassTemplateIdBySlot(client, session_date);
               }
-              // jeśli dzień niejednoznaczny / brak dopasowania – przerwij z komunikatem
+
               if (!cls.ok) {
                 if (canReplyNow) {
                   const why =
@@ -1205,12 +1188,13 @@ app.post('/webhook', async (req, res) => {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `❔ Nie mogę rozpoznać zajęć na ${formatHumanDate(session_date)} – ${why}. Podaj proszę dokładną godzinę lub nazwę zajęć.`,
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:reservation_disambiguate`
                   });
                 }
                 continue;
               }
-              // WALIDACJA poziomu i ceny
+
               const elig = await checkReservationEligibility(client, userId, cls.class_template_id);
               if (!elig.ok) {
                 if (canReplyNow) {
@@ -1218,10 +1202,16 @@ app.post('/webhook', async (req, res) => {
                     elig.reason === 'level_too_low' ? '❗ Twój poziom jest niższy niż wymagany dla tych zajęć.' :
                     elig.reason === 'price_too_low' ? '❗ Te zajęcia są droższe niż Twój limit cenowy.' :
                       '❗ Nie mogę potwierdzić uprawnień do rezerwacji.';
-                  await sendText({ to: rec.from_wa_id, body: msg, phoneNumberId: phoneNumberIdFromHook });
+                  await sendText({
+                    to: rec.from_wa_id,
+                    body: msg,
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:reservation_not_eligible`
+                  });
                 }
                 continue;
               }
+
               const r = await reserveOpenSlot(client, {
                 user_id: userId,
                 class_template_id: cls.class_template_id,
@@ -1234,31 +1224,36 @@ app.post('/webhook', async (req, res) => {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `✔️ Zarezerwowane: ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}.`,
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:reservation_ok`
                   });
                 } else if (r.ok && r.via === 'already_taken_by_user') {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `ℹ️ Już masz rezerwację na ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}.`,
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:reservation_already`
                   });
                 } else if (!r.ok && r.reason === 'no_open_slot_match') {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `❗ Brak wolnych miejsc na ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}.`,
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:reservation_full`
                   });
                 } else if (!r.ok && r.reason === 'race_lost') {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `⚠️ Ktoś właśnie zajął ostatnie miejsce na ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}. Spróbować inny termin?`,
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:reservation_race_lost`
                   });
                 } else {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `❗ Nie udało się zapisać. Napisz proszę datę i godzinę – spróbuję ponownie.`,
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:reservation_failed`
                   });
                 }
               }
@@ -1285,10 +1280,12 @@ app.post('/webhook', async (req, res) => {
                 if (canReplyNow) await sendText({
                   to: rec.from_wa_id,
                   body: '❔ Podaj proszę datę (np. 21.09) i ewentualnie godzinę (np. 19:00), żebym mógł odwołać Twoje miejsce.',
-                  phoneNumberId: phoneNumberIdFromHook
+                  phoneNumberId: phoneNumberIdFromHook,
+                  idempotencyKey: `${rec.provider_message_id}:absence_ask_date`
                 });
                 continue;
               }
+
               const result = await insertAbsenceIfPossible(client, candidate, rec.from_wa_id);
 
               if (canReplyNow) {
@@ -1299,13 +1296,16 @@ app.post('/webhook', async (req, res) => {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `✔️ Zgłoszona nieobecność: ${info}. Miejsce oddane do puli.`,
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:absence_ok`
                   });
                 } else if (result.reason === 'missing_user_mapping') {
+                  // (teoretycznie nie trafimy tu, bo mamy guard wyżej)
                   await sendText({
                     to: rec.from_wa_id,
                     body: '❗ Nie rozpoznaję Twojego numeru w systemie. Daj znać recepcji, aby Cię dodać.',
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:absence_unknown_user`
                   });
                 } else if (['ambiguous_slots_open','ambiguous_slots_any','no_slot_for_date','ambiguous_day_requires_time'].includes(result.reason)) {
                   const why = (result.reason === 'no_slot_for_date')
@@ -1317,47 +1317,39 @@ app.post('/webhook', async (req, res) => {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `❔ Nie mogę jednoznacznie przypisać zajęć na ${dateInfo} – ${why}. Podaj proszę godzinę lub nazwę zajęć.`,
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:absence_disambiguate`
                   });
                 } else if (result.reason === 'missing_session_date') {
                   await sendText({
                     to: rec.from_wa_id,
                     body: '❔ Podaj proszę datę (np. 21.09), żebym mógł odwołać Twoje miejsce.',
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:absence_missing_date`
                   });
                 } else {
                   await sendText({
                     to: rec.from_wa_id,
                     body: '❗ Nie udało się odwołać miejsca. Napisz proszę datę i godzinę – spróbuję ponownie.',
-                    phoneNumberId: phoneNumberIdFromHook
+                    phoneNumberId: phoneNumberIdFromHook,
+                    idempotencyKey: `${rec.provider_message_id}:absence_failed`
                   });
                 }
               }
+              continue;
             }
 
             // --- FALLBACK: potwierdzenie dla nieznanej treści ---------------------------
             if (canReplyNow && text && !isReservationIntent(text) && !isAbsenceIntent(text)) {
               await sendUnrecognizedAck({
                 to: rec.from_wa_id,
-                phoneNumberId: phoneNumberIdFromHook
+                phoneNumberId: phoneNumberIdFromHook,
                 idempotencyKey: `${rec.provider_message_id}:fallback`
               });
             }
           } // end for each message
         }
-      // jeśli numer nie jest znany w systemie → uprzejmy komunikat i koniec
-      const knownUserId = await resolveUserIdByWa(client, rec.from_wa_id);
-      if (!knownUserId) {
-        if (canReplyNow) {
-          await sendText({
-          to: rec.from_wa_id,
-          body: '📩 Otrzymaliśmy Twoją wiadomość, ale ten numer nie jest przypisany do żadnego uczestnika. Skontaktuj się z administratorem, aby dodać numer do systemu.',
-        phoneNumberId: phoneNumberIdFromHook
-        idempotencyKey: `${rec.provider_message_id}:unknown_user`
-      });
-  }
-  continue; // pomiń dalszą logikę (rezerwacje/nieobecności/fallback)
-}
+
         // statuses
         if (Array.isArray(v.statuses)) {
           for (const s of v.statuses) {
@@ -1390,12 +1382,10 @@ async function broadcastAskAbsencesTemplate(client, phoneNumberIdOverride = null
     return;
   }
 
-  // Nazwa szablonu z ENV
   const templateName = process.env.TEMPLATE_ABSENCE_REMINDER || 'absence_reminder';
   console.log(`[BROADCAST] ask-absences (tmpl) → ${recipients.length} osób, template=${templateName}`);
 
   for (const r of recipients) {
-    // spróbuj wydobyć imię z obiektu użytkownika
     const firstName =
       r.first_name ||
       r.firstName ||
@@ -1435,7 +1425,6 @@ async function broadcastFreeSlotsTemplateThenList(client, phoneNumberIdOverride 
     return;
   }
 
-  // Zakres do {{1}} (opcjonalna zmienna szablonu)
   const { startYMD, endYMD } = getNextWeekRangeWarsaw();
   const rangeHuman = (() => {
     const [ys, ms, ds] = startYMD.split('-');
@@ -1454,18 +1443,16 @@ async function broadcastFreeSlotsTemplateThenList(client, phoneNumberIdOverride 
   console.log(`[BROADCAST] free-slots (tmpl+list) → ${recipients.length} osób, slots=${slots.length}`);
 
   for (const r of recipients) {
-    // 1) szablon – otwiera okno BI 24h
     await sendTemplate({
       to: r.to,
       templateName: TEMPLATE_WEEKLY_SLOTS_INTRO,
       components: [
-        { type:'body', parameters:[ { type:'text', text: rangeHuman } ] } // usuń, jeśli szablon bez zmiennych
+        { type:'body', parameters:[ { type:'text', text: rangeHuman } ] }
       ],
       phoneNumberId: phoneNumberIdOverride
     });
     await pause(80);
 
-    // 2) free-form z listą wolnych slotów (już w otwartym oknie)
     await sendText({
       to: r.to,
       body: listBody,
@@ -1529,10 +1516,8 @@ if (String(process.env.ENABLE_CRON_CLEANUP_SLOTS || 'true').toLowerCase() === 't
    ========================= */
 const PORT = process.env.PORT || 3000;
 
-// proste zdrowie usługi (Render sprawdza to cyklicznie)
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
-// ważne: jawnie nasłuchuj na 0.0.0.0 (zewnętrzny interfejs kontenera)
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Webhook listening on :${PORT}`);
 });
