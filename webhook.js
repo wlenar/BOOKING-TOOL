@@ -304,13 +304,14 @@ function formatFreeSlotsMessage(slots) {
 /* =========================
    OUTBOUND (WhatsApp Cloud API) – retry/backoff
    ========================= */
-async function sendText({ to, body, phoneNumberId = null }) {
+async function sendText({ to, body, phoneNumberId = null, idempotencyKey = null }) {
   const phoneId = phoneNumberId || WA_PHONE_ID;
   if (!WA_TOKEN || !phoneId) {
     console.log('[OUTBOUND] Skipping send (missing WA_TOKEN or PHONE_ID)', { hasToken: !!WA_TOKEN, phoneId });
     await auditOutbound({ user_id: null, to_phone: to, message_type: 'text', body, status: 'skipped', reason: 'missing_credentials' });
     return { ok: false, reason: 'missing_config' };
   }
+
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
   const payload = {
     messaging_product: 'whatsapp',
@@ -319,16 +320,17 @@ async function sendText({ to, body, phoneNumberId = null }) {
     text: { body }
   };
 
+  // nagłówki z opcjonalnym X-Idempotency-Key
+  const headers = { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' };
+  if (idempotencyKey) headers['X-Idempotency-Key'] = idempotencyKey;
+
   let attempt = 0;
   await auditOutbound({ user_id: null, to_phone: to, message_type: 'text', body, status: 'queued' });
+
   while (true) {
     attempt += 1;
     try {
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
       if (resp.ok) {
         const data = await resp.json().catch(() => ({}));
         await auditOutbound({
@@ -337,12 +339,15 @@ async function sendText({ to, body, phoneNumberId = null }) {
         });
         return { ok: true, data };
       }
+
       const status = resp.status;
       const text = await resp.text().catch(() => '');
       const data = (() => { try { return JSON.parse(text); } catch { return { raw: text }; } })();
+
       const is5xx = status >= 500 && status <= 599;
       const is408 = status === 408;
       const is429 = status === 429;
+
       if ((is5xx || is408 || is429) && attempt <= OUTBOUND_MAX_RETRIES) {
         let delay = Math.floor(OUTBOUND_RETRY_BASE_MS * Math.pow(2, attempt - 1));
         delay += Math.floor(delay * Math.random() * 0.3);
@@ -355,8 +360,10 @@ async function sendText({ to, body, phoneNumberId = null }) {
         await sleep(delay);
         continue;
       }
+
       console.error('[OUTBOUND ERROR]', { status, data, attempt });
       return { ok: false, status, data, attempt };
+
     } catch (e) {
       const msg = String(e?.message || e);
       const retriable = /(timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|network|fetch failed)/i.test(msg);
@@ -368,7 +375,7 @@ async function sendText({ to, body, phoneNumberId = null }) {
         continue;
       }
       console.error('[OUTBOUND EXCEPTION]', msg, { attempt });
-      await auditOutbound({ user_id: null, to_phone: to, message_type: 'text', body, status: 'error', reason: String(e?.message || e) });
+      await auditOutbound({ user_id: null, to_phone: to, message_type: 'text', body, status: 'error', reason: msg });
       return { ok: false, reason: 'exception', error: msg, attempt };
     }
   }
@@ -1034,7 +1041,7 @@ async function cleanupOpenSlots(client, retainDays = 60) {
   return { deleted: res.rowCount };
 }
 
-async function sendUnrecognizedAck({ to, phoneNumberId = null }) {
+async function sendUnrecognizedAck({ to, phoneNumberId = null, idempotencyKey = null }) {
   const body = '📩 Otrzymaliśmy Twoją wiadomość. Nie potrafię jej automatycznie zinterpretować — przekażę ją do administratora.';
   return sendText({ to, body, phoneNumberId });
 }
@@ -1333,6 +1340,7 @@ app.post('/webhook', async (req, res) => {
               await sendUnrecognizedAck({
                 to: rec.from_wa_id,
                 phoneNumberId: phoneNumberIdFromHook
+                idempotencyKey: `${rec.provider_message_id}:fallback`
               });
             }
           } // end for each message
@@ -1345,6 +1353,7 @@ app.post('/webhook', async (req, res) => {
           to: rec.from_wa_id,
           body: '📩 Otrzymaliśmy Twoją wiadomość, ale ten numer nie jest przypisany do żadnego uczestnika. Skontaktuj się z administratorem, aby dodać numer do systemu.',
         phoneNumberId: phoneNumberIdFromHook
+        idempotencyKey: `${rec.provider_message_id}:unknown_user`
       });
   }
   continue; // pomiń dalszą logikę (rezerwacje/nieobecności/fallback)
