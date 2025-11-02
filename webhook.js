@@ -102,13 +102,14 @@ const MONTHS_GEN = {
 };
 
 const DOW_ISO = {
-  'poniedzialek':1,
-  'wtorek':2,
-  'sroda':3,'srode':3,
-  'czwartek':4,
-  'piatek':5,
-  'sobota':6,'sobote':6,
-  'niedziela':7,'niedziele':7
+  // mianownik + przypadki spotykane w mowie pisanej
+  'poniedzialek':1, 'poniedzialku':1,
+  'wtorek':2,       'wtorku':2,
+  'sroda':3,        'srode':3, 'srody':3,
+  'czwartek':4,     'czwartku':4,
+  'piatek':5,       'piatku':5,
+  'sobota':6,       'sobote':6, 'soboty':6,
+  'niedziela':7,    'niedziele':7, 'niedzieli':7
 };
 
 /* =========================
@@ -190,7 +191,51 @@ function parseDateTime(text) {
       target.setDate(now.getDate() + add);
     }
   }
-  
+    // --- "od <dzien> do <dzien> [o HH:MM]" → zakres dni tygodnia (najbliższy nadchodzący)
+  {
+    const reDow = '(poniedzial(?:ek|ku)|wtorku|wtorek|srod(?:a|e|y)|czwart(?:ek|ku)|piat(?:ek|ku)|sobot(?:a|e|y)|niedziel(?:a|e|i))';
+    const mRange = t.match(new RegExp(`\\bod\\s+${reDow}\\s+do\\s+${reDow}\\b`));
+    if (mRange) {
+      // opcjonalna godzina w tekście (np. "o 7:15")
+      let timeHH = null, timeMM = null;
+      const colonTimes = [...t.matchAll(/\b(\d{1,2}):(\d{2})\b/g)];
+      if (colonTimes.length) {
+        const last = colonTimes.at(-1);
+        timeHH = parseInt(last[1], 10);
+        timeMM = parseInt(last[2], 10);
+      } else {
+        const dotTime = t.match(/\b(?:godz(?:ina)?\s*|o\s+)(\d{1,2})\.(\d{2})\b/);
+        if (dotTime) {
+          timeHH = parseInt(dotTime[1], 10);
+          timeMM = parseInt(dotTime[2], 10);
+        }
+      }
+
+      const dow1 = normalize(mRange[1]);
+      const dow2 = normalize(mRange[2]);
+
+      const now = new Date();
+      const todayIso = ((now.getDay() + 6) % 7) + 1; // ISO 1..7
+      const want1 = DOW_ISO[dow1];
+      const want2 = DOW_ISO[dow2];
+
+      // najbliższe PRZYSZŁE wystąpienie startu (nie dzisiaj)
+      let addStart = (want1 - todayIso + 7) % 7;
+      if (addStart === 0) addStart = 7;
+
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() + addStart);
+
+      // koniec liczymy względem startu (>= start)
+      const endDelta = (want2 - want1 + 7) % 7; // 0 => ten sam dzień
+      const end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + endDelta);
+
+      return {
+        from: new Date(start.getFullYear(), start.getMonth(), start.getDate()),
+        to:   new Date(end.getFullYear(), end.getMonth(), end.getDate()),
+        session_time: timeHH != null ? `${String(timeHH).padStart(2,'0')}:${String(timeMM ?? 0).padStart(2,'0')}` : null
+      };
+    }
+  }
   for (const p of PERIOD_KEYWORDS) {
     if (p.re.test(t)) {
       const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
