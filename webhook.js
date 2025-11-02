@@ -1335,7 +1335,18 @@ app.post('/webhook', async (req, res) => {
             }
           } // end for each message
         }
-
+      // jeśli numer nie jest znany w systemie → uprzejmy komunikat i koniec
+      const knownUserId = await resolveUserIdByWa(client, rec.from_wa_id);
+      if (!knownUserId) {
+        if (canReplyNow) {
+          await sendText({
+          to: rec.from_wa_id,
+          body: '📩 Otrzymaliśmy Twoją wiadomość, ale ten numer nie jest przypisany do żadnego uczestnika. Skontaktuj się z administratorem, aby dodać numer do systemu.',
+        phoneNumberId: phoneNumberIdFromHook
+      });
+  }
+  continue; // pomiń dalszą logikę (rezerwacje/nieobecności/fallback)
+}
         // statuses
         if (Array.isArray(v.statuses)) {
           for (const s of v.statuses) {
