@@ -526,7 +526,8 @@ async function insertInboxRecord(client, rec) {
     rec.text_body, rec.status, rec.error_code, rec.error_title,
     rec.sent_ts, rec.payload_json
   ];
-  await client.query(sql, params);
+  const res = await client.query(sql, params);
+  return { inserted: res.rows.length > 0, id: res.rows[0]?.id || null };
 }
 
 async function resolveUserIdByWa(client, wa) {
@@ -1133,7 +1134,8 @@ app.post('/webhook', async (req, res) => {
         if (Array.isArray(v.messages)) {
           for (const m of v.messages) {
             const rec = mapWhatsAppMessageToRecord(m, v);
-            await insertInboxRecord(client, rec);
+            const ins = await insertInboxRecord(client, rec);
+            if (!ins.inserted) continue; // duplikat dostawy → nie odpowiadamy ponownie
 
             const text = rec.text_body || '';
             if (!text) continue;
