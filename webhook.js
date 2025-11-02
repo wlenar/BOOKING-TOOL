@@ -1033,6 +1033,11 @@ async function cleanupOpenSlots(client, retainDays = 60) {
   return { deleted: res.rowCount };
 }
 
+async function sendUnrecognizedAck({ to, phoneNumberId = null }) {
+  const body = '📩 Otrzymaliśmy Twoją wiadomość. Nie potrafię jej automatycznie zinterpretować — przekażę ją do administratora.';
+  return sendText({ to, body, phoneNumberId });
+}
+
 /* =========================
    WHATSAPP WEBHOOK
    ========================= */
@@ -1062,32 +1067,32 @@ function verifyMetaSignature(req) {
 app.post('/webhook', async (req, res) => {
   // (opcjonalnie) wymuś podpis, jeśli APP_SECRET jest ustawiony
   if (APP_SECRET) {
-  const sigHeader = req.get('x-hub-signature-256') || '';
-  const [prefix, sigHex] = sigHeader.split('=');
+    const sigHeader = req.get('x-hub-signature-256') || '';
+    const [prefix, sigHex] = sigHeader.split('=');
 
-  // podstawowe sanity checks
-  if (prefix !== 'sha256' || !sigHex) {
-    return res.status(403).send('Missing signature');
-  }
-  // policz oczekiwany podpis
-  const expectedHex = crypto
-    .createHmac('sha256', APP_SECRET)
-    .update(req.rawBody || Buffer.from([]))
-    .digest('hex');
+    // podstawowe sanity checks
+    if (prefix !== 'sha256' || !sigHex) {
+      return res.status(403).send('Missing signature');
+    }
+    // policz oczekiwany podpis
+    const expectedHex = crypto
+      .createHmac('sha256', APP_SECRET)
+      .update(req.rawBody || Buffer.from([]))
+      .digest('hex');
 
-  // porównujemy BAJTY (hex -> Buffer)
-  const a = Buffer.from(sigHex, 'hex');
-  const b = Buffer.from(expectedHex, 'hex');
+    // porównujemy BAJTY (hex -> Buffer)
+    const a = Buffer.from(sigHex, 'hex');
+    const b = Buffer.from(expectedHex, 'hex');
 
-  // zanim użyjemy timingSafeEqual, długości muszą się zgadzać
-  if (a.length !== b.length) {
-    return res.status(403).send('Bad signature');
+    // zanim użyjemy timingSafeEqual, długości muszą się zgadzać
+    if (a.length !== b.length) {
+      return res.status(403).send('Bad signature');
+    }
+    const ok = crypto.timingSafeEqual(a, b);
+    if (!ok) {
+      return res.status(403).send('Bad signature');
+    }
   }
-  const ok = crypto.timingSafeEqual(a, b);
-  if (!ok) {
-    return res.status(403).send('Bad signature');
-  }
-}
   console.log('[WEBHOOK HIT] headers.x-hub-signature-256=', req.get('x-hub-signature-256'));
   console.log('[WEBHOOK HIT] rawBody.len=', req.rawBody?.length, ' bodyIsArrayEntry=', Array.isArray(req.body?.entry));
 
@@ -1166,9 +1171,9 @@ app.post('/webhook', async (req, res) => {
                     AND ct.start_time  = $2::time
                 `, [session_date, session_time]);
 
-                 if (ctByTime.rowCount === 1) {
+                if (ctByTime.rowCount === 1) {
                   cls = { ok: true, class_template_id: ctByTime.rows[0].id, via: 'ct_by_time' };
-                 } else if (ctByTime.rowCount > 1) {
+                } else if (ctByTime.rowCount > 1) {
                   cls = { ok: false, reason: 'ambiguous_by_time' };
                 } else {
                   // brak klasy o tej godzinie – fallback do dotychczasowej logiki po dniu
@@ -1178,24 +1183,24 @@ app.post('/webhook', async (req, res) => {
                 cls = await resolveClassTemplateIdBySlot(client, session_date);
               }
               // jeśli dzień niejednoznaczny / brak dopasowania – przerwij z komunikatem
-                if (!cls.ok) {
-                  if (canReplyNow) {
-                    const why =
-                      (cls.reason === 'ambiguous_slots_open' || cls.reason === 'ambiguous_slots_any')
-                        ? 'tego dnia jest kilka różnych zajęć'
-                        : (cls.reason === 'ambiguous_by_time')
-                          ? 'o tej godzinie są różne zajęcia – podaj proszę nazwę grupy'
-                          : (cls.reason === 'no_slot_for_date')
-                            ? 'tego dnia nie ma żadnych zajęć'
-                            : 'brakuje danych';
-                      await sendText({
-                        to: rec.from_wa_id,
-                        body: `❔ Nie mogę rozpoznać zajęć na ${formatHumanDate(session_date)} – ${why}. Podaj proszę dokładną godzinę lub nazwę zajęć.`,
-                        phoneNumberId: phoneNumberIdFromHook
-                      });
-                  }
-                  continue;
+              if (!cls.ok) {
+                if (canReplyNow) {
+                  const why =
+                    (cls.reason === 'ambiguous_slots_open' || cls.reason === 'ambiguous_slots_any')
+                      ? 'tego dnia jest kilka różnych zajęć'
+                      : (cls.reason === 'ambiguous_by_time')
+                        ? 'o tej godzinie są różne zajęcia – podaj proszę nazwę grupy'
+                        : (cls.reason === 'no_slot_for_date')
+                          ? 'tego dnia nie ma żadnych zajęć'
+                          : 'brakuje danych';
+                  await sendText({
+                    to: rec.from_wa_id,
+                    body: `❔ Nie mogę rozpoznać zajęć na ${formatHumanDate(session_date)} – ${why}. Podaj proszę dokładną godzinę lub nazwę zajęć.`,
+                    phoneNumberId: phoneNumberIdFromHook
+                  });
                 }
+                continue;
+              }
               // WALIDACJA poziomu i ceny
               const elig = await checkReservationEligibility(client, userId, cls.class_template_id);
               if (!elig.ok) {
@@ -1320,7 +1325,15 @@ app.post('/webhook', async (req, res) => {
                 }
               }
             }
-          }
+
+            // --- FALLBACK: potwierdzenie dla nieznanej treści ---------------------------
+            if (canReplyNow && text && !isReservationIntent(text) && !isAbsenceIntent(text)) {
+              await sendUnrecognizedAck({
+                to: rec.from_wa_id,
+                phoneNumberId: phoneNumberIdFromHook
+              });
+            }
+          } // end for each message
         }
 
         // statuses
