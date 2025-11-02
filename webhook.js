@@ -29,8 +29,8 @@ app.use(express.json({
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const APP_SECRET = process.env.APP_SECRET || '';
 
-const WA_TOKEN     = process.env.WHATSAPP_TOKEN || null;
-const WA_PHONE_ID  = process.env.WHATSAPP_PHONE_NUMBER_ID || null;
+const WA_TOKEN     = process.env.WHATSAPP_TOKEN || process.env.META_TOKEN || null;
+const WA_PHONE_ID  = process.env.WHATSAPP_PHONE_NUMBER_ID || process.env.PHONE_NUMBER_ID || null;
 
 const TEMPLATE_LANG               = process.env.TEMPLATE_LANG || 'pl';
 const TEMPLATE_ABSENCE_REMINDER  = process.env.TEMPLATE_ABSENCE_REMINDER || null;   // np. booking_absence_reminder_pl
