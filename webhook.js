@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-const cron = require('node-cron');
+
 // dynamiczny import node-fetch (dziala na Node 16+; na Node 18+ jest global fetch)
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
@@ -28,20 +28,12 @@ app.use(express.json({
    ========================= */
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const APP_SECRET = process.env.APP_SECRET || '';
-
 const WA_TOKEN     = process.env.WHATSAPP_TOKEN || null;
 const WA_PHONE_ID  = process.env.WHATSAPP_PHONE_NUMBER_ID || null;
-
 const TEMPLATE_LANG               = process.env.TEMPLATE_LANG || 'pl';
-const TEMPLATE_ABSENCE_REMINDER  = process.env.TEMPLATE_ABSENCE_REMINDER || null;   // np. booking_absence_reminder_pl
-const TEMPLATE_WEEKLY_SLOTS_INTRO = process.env.TEMPLATE_WEEKLY_SLOTS_INTRO || null; // np. booking_free_slots_intro_pl
-
 const OUTBOUND_MAX_RETRIES   = Math.max(0, Number(process.env.OUTBOUND_MAX_RETRIES ?? 3));
 const OUTBOUND_RETRY_BASE_MS = Math.max(100, Number(process.env.OUTBOUND_RETRY_BASE_MS ?? 800));
-
-const ENABLE_CRON_BROADCAST = String(process.env.ENABLE_CRON_BROADCAST || 'true').toLowerCase() === 'true';
-const CRON_TZ               = process.env.CRON_TZ || 'Europe/Warsaw';
-const BROADCAST_BATCH_SLEEP_MS = Math.max(0, Number(process.env.BROADCAST_BATCH_SLEEP_MS || 150));
+const DEBUG = String(process.env.DEBUG || '0') === '1';
 
 const pool = new Pool(
   process.env.DATABASE_URL
@@ -266,79 +258,33 @@ function within24h(dateObj) {
 
 // pauzy / sleep
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-async function pause(ms) { if (ms > 0) await sleep(ms); }
 
-// „nadchodzący tydzień” = następny pon–niedz (Warszawa)
-function getNextWeekRangeWarsaw() {
-  const now = new Date();
-  const dow = now.getDay(); // 0 nd .. 6 sb
-  const daysToNextMon = ((8 - dow) % 7) || 7;
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysToNextMon);
-  const end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 7); // exclusive
-  const ymd = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-  return { startYMD: ymd(start), endYMD: ymd(end) };
+// === Unified WhatsApp outbound core (text + template) ===
+
+function resolvePhoneId(overrideId) {
+  return overrideId || WA_PHONE_ID || null;
+}
+function normalizeTo(to) {
+  return String(to).replace(/^\+/, '');
 }
 
-function formatFreeSlotsMessage(slots) {
-  if (!slots.length) return 'W nadchodzącym tygodniu nie ma wolnych terminów.';
-  const byDate = slots.reduce((acc, s) => {
-    (acc[s.session_date] ||= []).push(s);
-    return acc;
-  }, {});
-  const days = Object.keys(byDate).sort();
-
-  const lines = ['Wolne terminy w nadchodzącym tygodniu:'];
-  for (const d of days) {
-    const niceDate = formatHumanDate(d);
-    const items = byDate[d]
-      .sort((a,b) => (a.session_time||'99:99').localeCompare(b.session_time||'99:99'))
-      .map(s => {
-        const time = s.session_time ? ` ${s.session_time}` : '';
-        return `•${time} (klasa #${s.class_template_id})`;
-      });
-    lines.push(`${niceDate}:`);
-    lines.push(...items);
-  }
-  return lines.join('\n');
-}
-
-/* =========================
-   OUTBOUND (WhatsApp Cloud API) – retry/backoff
-   ========================= */
-async function sendText({ to, body, phoneNumberId = null, idempotencyKey = null }) {
-  const phoneId = phoneNumberId || WA_PHONE_ID;
+async function postWA({ phoneId, payload, idempotencyKey }) {
   if (!WA_TOKEN || !phoneId) {
-    console.log('[OUTBOUND] Skipping send (missing WA_TOKEN or PHONE_ID)', { hasToken: !!WA_TOKEN, phoneId });
-    await auditOutbound({ user_id: null, to_phone: to, message_type: 'text', body, status: 'skipped', reason: 'missing_credentials' });
     return { ok: false, reason: 'missing_config' };
   }
 
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: String(to).replace(/^\+/, ''), // bez plusa
-    type: 'text',
-    text: { body }
-  };
-
-  // nagłówki z opcjonalnym X-Idempotency-Key
   const headers = { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' };
   if (idempotencyKey) headers['X-Idempotency-Key'] = idempotencyKey;
 
   let attempt = 0;
-  await auditOutbound({ user_id: null, to_phone: to, message_type: 'text', body, status: 'queued' });
-
   while (true) {
     attempt += 1;
     try {
       const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
       if (resp.ok) {
         const data = await resp.json().catch(() => ({}));
-        await auditOutbound({
-          user_id: null, to_phone: to, message_type: 'text', body,
-          status: 'sent', wa_message_id: data?.messages?.[0]?.id || null
-        });
-        return { ok: true, data };
+        return { ok: true, data, attempt };
       }
 
       const status = resp.status;
@@ -357,99 +303,86 @@ async function sendText({ to, body, phoneNumberId = null, idempotencyKey = null 
           const raMs = ra ? Number(ra) * 1000 : NaN;
           if (!Number.isNaN(raMs) && raMs > 0) delay = Math.max(delay, raMs);
         }
-        console.warn(`[OUTBOUND RETRY] status=${status} attempt=${attempt}/${OUTBOUND_MAX_RETRIES} delay=${delay}ms`, data);
         await sleep(delay);
         continue;
       }
 
-      console.error('[OUTBOUND ERROR]', { status, data, attempt });
       return { ok: false, status, data, attempt };
-
     } catch (e) {
       const msg = String(e?.message || e);
       const retriable = /(timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|network|fetch failed)/i.test(msg);
       if (retriable && attempt <= OUTBOUND_MAX_RETRIES) {
         let delay = Math.floor(OUTBOUND_RETRY_BASE_MS * Math.pow(2, attempt - 1));
         delay += Math.floor(delay * Math.random() * 0.3);
-        console.warn(`[OUTBOUND RETRY EXC] attempt=${attempt}/${OUTBOUND_MAX_RETRIES} delay=${delay}ms reason=${msg}`);
         await sleep(delay);
         continue;
       }
-      console.error('[OUTBOUND EXCEPTION]', msg, { attempt });
-      await auditOutbound({ user_id: null, to_phone: to, message_type: 'text', body, status: 'error', reason: msg });
       return { ok: false, reason: 'exception', error: msg, attempt };
     }
   }
 }
 
-// Szablony (business-initiated) – z retry/backoff
-async function sendTemplate({ to, templateName, lang = TEMPLATE_LANG, components = [], phoneNumberId = null }) {
-  const phoneId = phoneNumberId || WA_PHONE_ID;
+// Tekst
+async function sendText({ to, body, phoneNumberId = null, idempotencyKey = null }) {
+  const phoneId = resolvePhoneId(phoneNumberId);
+  const toNorm  = normalizeTo(to);
+
   if (!WA_TOKEN || !phoneId) {
-    console.log('[OUTBOUND-TMPL] Skipping (missing token or phoneId)');
-    return { ok:false, reason:'missing_config' };
+    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'text', body, status: 'skipped', reason: 'missing_credentials' });
+    return { ok: false, reason: 'missing_config' };
   }
-  const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
+
   const payload = {
     messaging_product: 'whatsapp',
-    to: String(to).replace(/^\+/, ''),
-    type: 'template',
-    template: {
-      name: templateName,
-      language: { code: lang },
-      components: components
-    }
+    to: toNorm,
+    type: 'text',
+    text: { body }
   };
 
-  let attempt = 0;
-  while (true) {
-    attempt += 1;
-    try {
-      const resp = await fetch(url, {
-        method:'POST',
-        headers:{ Authorization:`Bearer ${WA_TOKEN}`, 'Content-Type':'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (resp.ok) {
-        const data = await resp.json().catch(()=>({}));
-        return { ok:true, data };
-      }
-      const status = resp.status;
-      const text = await resp.text().catch(()=> '');
-      let data; try { data = JSON.parse(text); } catch { data = { raw:text }; }
+  await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'text', body, status: 'queued' });
+  const res = await postWA({ phoneId, payload, idempotencyKey });
 
-      const is5xx = status >= 500 && status <= 599;
-      const is408 = status === 408;
-      const is429 = status === 429;
-      if ((is5xx || is408 || is429) && attempt <= OUTBOUND_MAX_RETRIES) {
-        let delay = Math.floor(OUTBOUND_RETRY_BASE_MS * Math.pow(2, attempt - 1));
-        delay += Math.floor(delay * Math.random() * 0.3);
-        if (is429) {
-          const ra = resp.headers.get('retry-after');
-          const raMs = ra ? Number(ra) * 1000 : NaN;
-          if (!Number.isNaN(raMs) && raMs > 0) delay = Math.max(delay, raMs);
-        }
-        console.warn(`[OUTBOUND-TMPL RETRY] status=${status} attempt=${attempt}/${OUTBOUND_MAX_RETRIES} delay=${delay}ms`, data);
-        await sleep(delay);
-        continue;
-      }
-      console.error('[OUTBOUND-TMPL ERROR]', { status, data, attempt });
-      return { ok:false, status, data, attempt };
-    } catch (e) {
-      const msg = String(e?.message || e);
-      const retriable = /(timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|network|fetch failed)/i.test(msg);
-      if (retriable && attempt <= OUTBOUND_MAX_RETRIES) {
-        let delay = Math.floor(OUTBOUND_RETRY_BASE_MS * Math.pow(2, attempt - 1));
-        delay += Math.floor(delay * Math.random() * 0.3);
-        console.warn(`[OUTBOUND-TMPL RETRY EXC] attempt=${attempt}/${OUTBOUND_MAX_RETRIES} delay=${delay}ms reason=${msg}`);
-        await sleep(delay);
-        continue;
-      }
-      console.error('[OUTBOUND-TMPL EXCEPTION]', msg, { attempt });
-      return { ok:false, reason:'exception', error:msg, attempt };
-    }
+  if (res.ok) {
+    const waId = res?.data?.messages?.[0]?.id || null;
+    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'text', body, status: 'sent', wa_message_id: waId });
+  } else {
+    const reason = res.reason || (res.status ? `http_${res.status}` : 'unknown');
+    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'text', body, status: 'error', reason });
   }
+  return res;
 }
+
+// Template
+async function sendTemplate({ to, templateName, lang = (TEMPLATE_LANG || 'pl'), components = [], phoneNumberId = null, idempotencyKey = null }) {
+  const phoneId = resolvePhoneId(phoneNumberId);
+  const toNorm  = normalizeTo(to);
+
+  if (!WA_TOKEN || !phoneId) {
+    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'template', template_name: templateName, variables: components, status: 'skipped', reason: 'missing_credentials' });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'template',
+    template: { name: templateName, language: { code: lang }, components }
+  };
+
+  await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'template', template_name: templateName, variables: components, status: 'queued' });
+  const res = await postWA({ phoneId, payload, idempotencyKey });
+
+  if (res.ok) {
+    const waId = res?.data?.messages?.[0]?.id || null;
+    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'template', template_name: templateName, variables: components, status: 'sent', wa_message_id: waId });
+  } else {
+    const reason = res.reason || (res.status ? `http_${res.status}` : 'unknown');
+    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'template', template_name: templateName, variables: components, status: 'error', reason });
+  }
+  return res;
+}
+
+// Szablony (business-initiated) – z retry/backoff
 
 /* =========================
    MAPOWANIE WIADOMOŚCI / STATUSÓW
@@ -881,158 +814,8 @@ async function reserveOpenSlot(client, { user_id, class_template_id, session_dat
   }
 }
 
-// 📋 Lista aktywnych użytkowników z numerem i imieniem
-async function getAllRecipients(client) {
-  const sql = `
-    SELECT 
-      id AS user_id,
-      phone_e164 AS e164,
-      first_name
-    FROM public.users
-    WHERE 
-      phone_e164 IS NOT NULL
-      AND is_active = true
-  `;
-  const { rows } = await client.query(sql);
-
-  return rows.map(r => ({
-    to: String(r.e164).replace(/^\+/, ''),
-    user_id: r.user_id,
-    first_name: r.first_name
-  }));
-}
-
-// stworzenie wolnych slotów wynikających z wolnych miejsc na grupach
-async function ensureWeeklyOpenSlots() {
-  const client = await pool.connect();
-  try {
-    const sql = `
-      WITH dates AS (
-        SELECT (CURRENT_DATE + i) AS d FROM generate_series(1,7) AS i
-      ),
-      ct AS (
-        SELECT ct.id AS class_template_id, ct.weekday_iso, g.max_capacity AS capacity
-        FROM class_templates ct
-        JOIN groups g ON g.id = ct.group_id
-        WHERE ct.is_active = true AND g.is_active = true
-      ),
-      ct_dates AS (
-        SELECT ct.class_template_id, d::date AS session_date, ct.capacity
-        FROM ct JOIN dates ON ct.weekday_iso = EXTRACT(ISODOW FROM d)::int
-      ),
-      enr AS (
-        SELECT class_template_id, COUNT(DISTINCT user_id) AS enrolled
-        FROM enrollments GROUP BY class_template_id
-      ),
-      existing AS (
-        SELECT class_template_id, session_date,
-            COUNT(*) FILTER (WHERE state='open' AND source_absence_id IS NULL) AS open_generated
-        FROM slots
-        WHERE session_date BETWEEN CURRENT_DATE + 1 AND CURRENT_DATE + 7
-        GROUP BY class_template_id, session_date
-      ),
-      need AS (
-        SELECT
-          cd.class_template_id,
-          cd.session_date,
-          GREATEST(cd.capacity - COALESCE(e.enrolled,0) - COALESCE(x.open_generated,0), 0) AS to_create
-        FROM ct_dates cd
-        LEFT JOIN enr e ON e.class_template_id = cd.class_template_id
-        LEFT JOIN existing x ON x.class_template_id = cd.class_template_id AND x.session_date = cd.session_date
-      )
-      INSERT INTO slots (class_template_id, session_date, state, user_id, source_absence_id)
-      SELECT n.class_template_id, n.session_date, 'open', NULL, NULL
-      FROM need n
-      JOIN LATERAL generate_series(1, n.to_create) gs(i) ON true;
-    `;
-    await client.query('BEGIN');
-    const res = await client.query(sql);
-    await client.query('COMMIT');
-    console.log('[WEEKLY SLOTS] inserted baseline opens:', res.rowCount);
-    } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('[WEEKLY SLOTS][ERROR]', e);
-   } finally {
-    client.release();
-  }
-}
-
-// wolne sloty w nadchodzącym tygodniu
-async function getOpenSlotsNextWeek(client) {
-  const { startYMD, endYMD } = getNextWeekRangeWarsaw();
-  const colsRes = await client.query(`
-    SELECT column_name FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='slots'
-  `);
-  const hasSessionTime = colsRes.rows.some(r => r.column_name === 'session_time');
-
-  const sql = `
-    SELECT id, class_template_id, session_date${hasSessionTime ? ', session_time' : ', NULL::text AS session_time'}
-    FROM public.slots
-    WHERE status = 'open'
-      AND session_date >= $1::date
-      AND session_date <  $2::date
-    ORDER BY session_date ASC, ${hasSessionTime ? 'session_time NULLS LAST,' : ''} id ASC
-    LIMIT 500
-  `;
-  const { rows } = await client.query(sql, [startYMD, endYMD]);
-  return rows;
-}
-
-// Tworzy sloty na horyzoncie N dni (domyślnie 14)
-async function createSlotsForRollingHorizon(client, daysAhead = 14) {
-  const sql = `
-    WITH horizon AS (
-      SELECT (CURRENT_DATE + gs.i)::date AS d
-      FROM generate_series(1, $1::int) AS gs(i)
-    ),
-    cap AS (
-      SELECT ct.id AS class_template_id,
-             ct.weekday_iso,
-             g.max_capacity AS capacity,
-             COALESCE(cnt.enrolled, 0) AS enrolled
-      FROM public.class_templates ct
-      JOIN public.groups g ON g.id = ct.group_id
-      LEFT JOIN (
-        SELECT e.class_template_id, COUNT(*)::int AS enrolled
-        FROM public.enrollments e
-        GROUP BY e.class_template_id
-      ) AS cnt ON cnt.class_template_id = ct.id
-      WHERE ct.is_active = TRUE AND g.is_active = TRUE
-    ),
-    to_insert AS (
-      SELECT c.class_template_id, h.d AS session_date
-      FROM horizon h
-      JOIN cap c ON c.weekday_iso = EXTRACT(ISODOW FROM h.d)::int
-      WHERE (c.capacity - c.enrolled) > 0
-        AND NOT EXISTS (
-          SELECT 1 FROM public.slots s
-           WHERE s.class_template_id = c.class_template_id
-             AND s.session_date      = h.d
-        )
-    )
-    INSERT INTO public.slots (class_template_id, session_date, status)
-    SELECT class_template_id, session_date, 'open'
-    FROM to_insert
-    RETURNING id;
-  `;
-  const { rows } = await client.query(sql, [daysAhead]);
-  return { inserted: rows.length, daysAhead };
-}
-
-async function cleanupOpenSlots(client, retainDays = 60) {
-  const sql = `
-    DELETE FROM public.slots
-    WHERE status = 'open'
-      AND session_date < CURRENT_DATE - ($1::int * INTERVAL '1 day')
-    RETURNING id;
-  `;
-  const res = await client.query(sql, [retainDays]);
-  return { deleted: res.rowCount };
-}
-
 async function sendUnrecognizedAck({ to, phoneNumberId = null, idempotencyKey = null }) {
-  const body = '📩 Otrzymaliśmy Twoją wiadomość. Nie potrafię jej automatycznie zinterpretować — przekażę ją do administratora.';
+  const body = '📩 Dziękujemy za wiadomość';
   return sendText({ to, body, phoneNumberId, idempotencyKey });
 }
 
@@ -1045,22 +828,14 @@ app.get('/webhook', (req, res) => {
   const challenge = req.query['hub.challenge'];
 
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('Webhook verified');
+    if (DEBUG) console.log('[WEBHOOK HIT]', req.rawBody?.length);
     return res.status(200).send(challenge);
   }
-  console.warn('Webhook verify failed:', { mode, tokenOk: token === VERIFY_TOKEN });
+  if (DEBUG) console.log('[WEBHOOK HIT]', req.rawBody?.length);
   return res.sendStatus(403);
 });
 
 // (opcjonalnie) podpis X-Hub-Signature-256
-function verifyMetaSignature(req) {
-  if (!APP_SECRET) return true;
-  const sig = req.get('X-Hub-Signature-256');
-  if (!sig) return false;
-  const hmac = crypto.createHmac('sha256', APP_SECRET);
-  const digest = 'sha256=' + hmac.update(JSON.stringify(req.body)).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig));
-}
 
 app.post('/webhook', async (req, res) => {
   // (opcjonalnie) wymuś podpis, jeśli APP_SECRET jest ustawiony
@@ -1077,10 +852,7 @@ app.post('/webhook', async (req, res) => {
     const ok = crypto.timingSafeEqual(a, b);
     if (!ok) return res.status(403).send('Bad signature');
   }
-
-  console.log('[WEBHOOK HIT] headers.x-hub-signature-256=', req.get('x-hub-signature-256'));
-  console.log('[WEBHOOK HIT] rawBody.len=', req.rawBody?.length, ' bodyIsArrayEntry=', Array.isArray(req.body?.entry));
-
+    
   let body;
   try {
     if (req.body && Object.keys(req.body).length) {
@@ -1095,10 +867,8 @@ app.post('/webhook', async (req, res) => {
     return res.status(400).send('Bad JSON');
   }
 
-  console.log('[WEBHOOK BODY PREVIEW]', typeof body, 'keys=', Object.keys(body || {}));
-
   if (!body || !Array.isArray(body.entry)) {
-    console.log('[WEBHOOK] brak entry[] → 200');
+    if (DEBUG) console.log('[WEBHOOK HIT]', req.rawBody?.length);
     return res.sendStatus(200);
   }
 
@@ -1111,9 +881,7 @@ app.post('/webhook', async (req, res) => {
       for (const ch of changes) {
         const v = ch?.value || {};
         const phoneNumberIdFromHook = v?.metadata?.phone_number_id || null;
-        
-        console.log('[WEBHOOK CHANGE]', 'hasMessagesArray=', Array.isArray(v.messages), 'hasStatusesArray=', Array.isArray(v.statuses));
-
+                
         // messages
         if (Array.isArray(v.messages)) {
           for (const m of v.messages) {
@@ -1235,7 +1003,7 @@ app.post('/webhook', async (req, res) => {
                     phoneNumberId: phoneNumberIdFromHook,
                     idempotencyKey: `${rec.provider_message_id}:reservation_already`
                   });
-                } else if (!r.ok && r.reason === 'no_open_slot_match') {
+                } else if (!r.ok && r.reason === 'no_open_slot_for_date') {
                   await sendText({
                     to: rec.from_wa_id,
                     body: `❗ Brak wolnych miejsc na ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}.`,
@@ -1371,146 +1139,6 @@ app.post('/webhook', async (req, res) => {
     client.release();
   }
 });
-
-/* =========================
-   CRON – sobota/niedziela z SZABLONAMI
-   ========================= */
-// 🔔 Sobota 16:00 – wysyłka szablonu "absence_reminder"
-async function broadcastAskAbsencesTemplate(client, phoneNumberIdOverride = null) {
-  const recipients = await getAllRecipients(client);
-  if (!recipients.length) {
-    console.log('[BROADCAST] ask-absences (tmpl): brak odbiorców');
-    return;
-  }
-
-  const templateName = process.env.TEMPLATE_ABSENCE_REMINDER || 'absence_reminder';
-  console.log(`[BROADCAST] ask-absences (tmpl) → ${recipients.length} osób, template=${templateName}`);
-
-  for (const r of recipients) {
-    const firstName =
-      r.first_name ||
-      r.firstName ||
-      (r.name ? String(r.name).split(/\s+/)[0] : null) ||
-      (r.full_name ? String(r.full_name).split(/\s+/)[0] : null) ||
-      'Cześć';
-
-    try {
-      await sendTemplate({
-        to: r.to,
-        templateName: templateName,
-        components: [
-          {
-            type: 'body',
-            parameters: [{ type: 'text', text: firstName }]
-          }
-        ],
-        phoneNumberId: phoneNumberIdOverride
-      });
-
-      console.log(`[BROADCAST] absence_reminder → ${r.to} (${firstName})`);
-      await pause(BROADCAST_BATCH_SLEEP_MS);
-    } catch (e) {
-      console.error(`[BROADCAST ERROR] absence_reminder → ${r.to}`, e.message);
-    }
-  }
-}
-
-async function broadcastFreeSlotsTemplateThenList(client, phoneNumberIdOverride = null) {
-  const recipients = await getAllRecipients(client);
-  if (!recipients.length) {
-    console.log('[BROADCAST] free-slots (tmpl): brak odbiorców');
-    return;
-  }
-  if (!TEMPLATE_WEEKLY_SLOTS_INTRO) {
-    console.warn('[BROADCAST] brak TEMPLATE_WEEKLY_SLOTS_INTRO w ENV');
-    return;
-  }
-
-  const { startYMD, endYMD } = getNextWeekRangeWarsaw();
-  const rangeHuman = (() => {
-    const [ys, ms, ds] = startYMD.split('-');
-    const [ye, me, de] = endYMD.split('-');
-    const endDate = new Date(Number(ye), Number(me)-1, Number(de));
-    endDate.setDate(endDate.getDate() - 1);
-    const dd = String(endDate.getDate()).padStart(2,'0');
-    const mm = String(endDate.getMonth()+1).padStart(2,'0');
-    const yyyy = endDate.getFullYear();
-    return ` (${ds}.${ms}–${dd}.${mm}.${yyyy})`;
-  })();
-
-  const slots = await getOpenSlotsNextWeek(client);
-  const listBody = formatFreeSlotsMessage(slots);
-
-  console.log(`[BROADCAST] free-slots (tmpl+list) → ${recipients.length} osób, slots=${slots.length}`);
-
-  for (const r of recipients) {
-    await sendTemplate({
-      to: r.to,
-      templateName: TEMPLATE_WEEKLY_SLOTS_INTRO,
-      components: [
-        { type:'body', parameters:[ { type:'text', text: rangeHuman } ] }
-      ],
-      phoneNumberId: phoneNumberIdOverride
-    });
-    await pause(80);
-
-    await sendText({
-      to: r.to,
-      body: listBody,
-      phoneNumberId: phoneNumberIdOverride
-    });
-
-    await pause(BROADCAST_BATCH_SLEEP_MS);
-  }
-}
-
-if (ENABLE_CRON_BROADCAST) {
-  // ✅ Sobota 16:00 – prośba o zgłoszenie nieobecności
-  cron.schedule('0 16 * * 6', async () => {
-    const client = await pool.connect();
-    try {
-      console.log('[CRON] sobota 16:00 → ask-absences (template)');
-      await broadcastAskAbsencesTemplate(client, null);
-    } catch (e) {
-      console.error('[CRON ask-absences tmpl ERROR]', e);
-    } finally {
-      client.release();
-    }
-  }, { timezone: CRON_TZ });
-}
-
-if (String(process.env.ENABLE_CRON_SLOTS || 'true').toLowerCase() === 'true') {
-  // Codziennie 06:00 (Europe/Warsaw): utrzymuj horyzont 14 dni do przodu
-  cron.schedule('0 6 * * *', async () => {
-    const client = await pool.connect();
-    try {
-      console.log('[CRON] daily 06:00 → create slots rolling horizon 14d');
-      const r = await createSlotsForRollingHorizon(client, 14);
-      console.log(`[CRON] rolling slots: +${r.inserted} (horizon=${r.daysAhead}d)`);
-    } catch (e) {
-      console.error('[CRON slots ERROR]', e);
-    } finally {
-      client.release();
-    }
-  }, { timezone: CRON_TZ });
-}
-
-if (String(process.env.ENABLE_CRON_CLEANUP_SLOTS || 'true').toLowerCase() === 'true') {
-  // Codziennie 03:10 (Europe/Warsaw): czyść stare open sloty
-  cron.schedule('10 3 * * *', async () => {
-    const client = await pool.connect();
-    try {
-      const retain = Math.max(1, Number(process.env.RETAIN_DAYS_OPEN_SLOTS || 60));
-      console.log(`[CRON] 03:10 → cleanup open slots older than ${retain}d`);
-      const r = await cleanupOpenSlots(client, retain);
-      console.log(`[CRON] cleanup done: deleted=${r.deleted}`);
-    } catch (e) {
-      console.error('[CRON cleanup ERROR]', e);
-    } finally {
-      client.release();
-    }
-  }, { timezone: CRON_TZ });
-}
 
 /* =========================
    START
