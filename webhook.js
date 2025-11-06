@@ -65,15 +65,19 @@ async function resolveSenderType(client, wa) {
   const waPlus = '+' + waBare;
 
   const u = await client.query(
-    `SELECT id, first_name AS name, active FROM public.users 
-     WHERE phone_e164=$1 OR phone_raw=$2 OR phone_raw=$1 LIMIT 1`,
+      `SELECT id, first_name AS name, is_active AS active
+      FROM public.users
+      WHERE phone_e164 = $1 OR phone_raw = $2 OR phone_raw = $1
+      LIMIT 1`,
     [waPlus, waBare]
   );
   if (u.rowCount > 0) return { type: 'user', ...u.rows[0] };
 
   const i = await client.query(
-    `SELECT id, first_name AS name FROM public.instructors 
-     WHERE phone_e164=$1 OR phone_raw=$2 OR phone_raw=$1 LIMIT 1`,
+      `SELECT id, first_name AS name, is_active AS active
+      FROM public.instructors
+      WHERE phone_e164 = $1 OR phone_raw = $2 OR phone_raw = $1
+      LIMIT 1`,
     [waPlus, waBare]
   );
   if (i.rowCount > 0) return { type: 'instructor', ...i.rows[0], active: true };
