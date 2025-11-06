@@ -1,13 +1,28 @@
-// ==== MINIMAL WHATSAPP WEBHOOK (CLEAN) ====
+// ==== WHATSAPP WEBHOOK — PROVIDER SCHEMA (FINAL) ====
 // Version: 2025-11-06
+// Tailored for table public.inbox_messages with columns (subset used):
+//   source text DEFAULT 'whatsapp' NOT NULL
+//   provider_uid text NOT NULL
+//   provider_message_id text
+//   message_direction text DEFAULT 'inbound' NOT NULL
+//   message_type text NOT NULL
+//   from_wa_id text
+//   from_msisdn text
+//   to_msisdn text
+//   text_body text
+//   status text
+//   error_code text
+//   error_title text
+//   sent_ts timestamptz
+//   received_at timestamptz DEFAULT now() NOT NULL
+//   payload_json jsonb NOT NULL
+//
 // Features:
-//  - GET /webhook (Meta verification via VERIFY_TOKEN)
-//  - POST /webhook (HMAC X-Hub-Signature-256 via APP_SECRET)
-//  - Auto-reply "Dziękujemy za informację." to every inbound message
-//  - Optional DB audit (safe, best-effort) to table `inbox_messages`
-// Notes:
-//  - No business logic, no cron, no parsers
-//  - Start command: node webhook.min.js
+//  - GET /webhook (VERIFY_TOKEN)
+//  - POST /webhook with HMAC (APP_SECRET)
+//  - Insert inbound + status rows to provider-style schema
+//  - Auto-reply "Dziękujemy za informację." on inbound
+//  - No dynamic schema detection, no cron, no business logic
 
 'use strict';
 
@@ -23,7 +38,7 @@ const {
   VERIFY_TOKEN,
   APP_SECRET,
   WA_TOKEN,
-  WA_PHONE_ID,
+  WA_PHONE_ID,          // provider_uid
   DATABASE_URL,
   LOG_LEVEL = 'info',
 } = process.env;
@@ -37,52 +52,13 @@ function log(level, msg, obj) {
   }
 }
 
-// ---- DB (optional) ----
-let pool = null;
-if (DATABASE_URL) {
-  pool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  });
-}
-
-// Ensure minimal inbox table (idempotent)
-async function ensureInboxSchema() {
-  if (!pool) return;
-  const ddl = `
-    create table if not exists inbox_messages (
-      id bigserial primary key,
-      message_id   text,
-      direction    text,
-      from_phone   text,
-      to_phone     text,
-      message_type text,
-      status       text,
-      body         text,
-      raw          jsonb,
-      event_ts     timestamptz default now()
-    );
-  `;
-  try {
-    await pool.query(ddl);
-    log('info', '[DB] inbox_messages ensured');
-  } catch (e) {
-    log('warn', '[DB] ensureInboxSchema failed', { error: e.message });
-  }
-}
-
-async function auditInbound({ message_id, from_phone, to_phone, message_type, body, raw }) {
-  if (!pool) return;
-  try {
-    const sql = `insert into inbox_messages
-      (message_id, direction, from_phone, to_phone, message_type, body, raw)
-      values ($1, 'inbound', $2, $3, $4, $5, $6)`;
-    const params = [message_id, from_phone, to_phone, message_type, body, JSON.stringify(raw || null)];
-    await pool.query(sql, params);
-  } catch (e) {
-    log('warn', '[AUDIT][INBOUND] skip', { error: e.message });
-  }
-}
+// ---- DB ----
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    })
+  : null;
 
 // ---- App ----
 const app = express();
@@ -90,7 +66,7 @@ app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf; }
 }));
 
-// HMAC verify
+// ---- HMAC verify ----
 function verifyMetaSignature(req) {
   try {
     if (!APP_SECRET) return true;
@@ -103,10 +79,10 @@ function verifyMetaSignature(req) {
   }
 }
 
-// Health
+// ---- Health ----
 app.get('/health', (_req, res) => res.status(200).json({ ok: true, file: __filename }));
 
-// GET verify
+// ---- GET /webhook (verification) ----
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -119,7 +95,7 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-// POST receiver
+// ---- POST /webhook ----
 app.post('/webhook', async (req, res) => {
   if (!verifyMetaSignature(req)) {
     log('warn', '[WEBHOOK] Invalid signature');
@@ -134,31 +110,56 @@ app.post('/webhook', async (req, res) => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const data = change.value || {};
-        const toPhone = data?.metadata?.display_phone_number || null;
 
+        // Inbound messages
         if (Array.isArray(data.messages)) {
           for (const m of data.messages) {
-            // audit best-effort
-            await auditInbound({
-              message_id: m.id,
-              from_phone: m.from || null,
-              to_phone: toPhone,
-              message_type: m.type || null,
-              body: m.text?.body ||
-                    m.button?.text ||
-                    m.interactive?.button_reply?.title ||
-                    m.interactive?.list_reply?.title ||
-                    null,
-              raw: { entry, change, message: m },
-            });
+            try {
+              await insertInboundProvider({
+                provider_uid: data.metadata?.phone_number_id || WA_PHONE_ID || null,
+                provider_message_id: m.id || null,
+                message_type: m.type || null,
+                from_wa_id: m.from || null,
+                from_msisdn: normalizeMsisdn(m.from),
+                to_msisdn: normalizeMsisdn(data.metadata?.display_phone_number),
+                text_body: m.text?.body ||
+                           m.button?.text ||
+                           m.interactive?.button_reply?.title ||
+                           m.interactive?.list_reply?.title ||
+                           null,
+                payload_json: { entry, change, message: m },
+              });
+            } catch (e) {
+              log('warn', '[AUDIT][INBOUND] skip', { error: e.message });
+            }
 
-            // AUTO-REPLY (session message < 24h)
+            // Auto-ACK
             if (m.from) {
               try {
                 await sendText({ to: m.from, body: 'Dziękujemy za informację.' });
               } catch (e) {
                 log('warn', '[OUTBOUND][ACK] failed', { error: e.message });
               }
+            }
+          }
+        }
+
+        // Status updates
+        if (Array.isArray(data.statuses)) {
+          for (const s of data.statuses) {
+            try {
+              await insertStatusProvider({
+                provider_uid: data.metadata?.phone_number_id || WA_PHONE_ID || null,
+                provider_message_id: s.id || null,
+                to_msisdn: normalizeMsisdn(s.recipient_id),
+                status: s.status || null,
+                error_code: s.errors?.[0]?.code ? String(s.errors[0].code) : null,
+                error_title: s.errors?.[0]?.title || null,
+                sent_ts: s.timestamp ? toTimestamp(s.timestamp) : null,
+                payload_json: { entry, change, status: s },
+              });
+            } catch (e) {
+              log('warn', '[AUDIT][STATUS] skip', { error: e.message });
             }
           }
         }
@@ -169,15 +170,86 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ---- Outbound helpers ----
+// ---- Inserts for provider schema ----
+async function insertInboundProvider({
+  provider_uid,
+  provider_message_id,
+  message_type,
+  from_wa_id,
+  from_msisdn,
+  to_msisdn,
+  text_body,
+  payload_json,
+}) {
+  if (!pool) return;
+  const sql = `
+    insert into inbox_messages
+      (source, provider_uid, provider_message_id, message_direction, message_type,
+       from_wa_id, from_msisdn, to_msisdn, text_body, payload_json, received_at)
+    values
+      ('whatsapp', $1, $2, 'inbound', $3, $4, $5, $6, $7, $8, now())
+  `;
+  const params = [
+    provider_uid,
+    provider_message_id,
+    message_type,
+    from_wa_id,
+    from_msisdn,
+    to_msisdn,
+    text_body,
+    JSON.stringify(payload_json || null),
+  ];
+  await pool.query(sql, params);
+}
+
+async function insertStatusProvider({
+  provider_uid,
+  provider_message_id,
+  to_msisdn,
+  status,
+  error_code,
+  error_title,
+  sent_ts,
+  payload_json,
+}) {
+  if (!pool) return;
+  const sql = `
+    insert into inbox_messages
+      (source, provider_uid, provider_message_id, message_direction, to_msisdn,
+       status, error_code, error_title, sent_ts, payload_json, received_at)
+    values
+      ('whatsapp', $1, $2, 'outbound', $3, $4, $5, $6, $7, $8, now())
+  `;
+  const params = [
+    provider_uid,
+    provider_message_id,
+    to_msisdn,
+    status,
+    error_code,
+    error_title,
+    sent_ts,
+    JSON.stringify(payload_json || null),
+  ];
+  await pool.query(sql, params);
+}
+
+// ---- Outbound helper ----
 async function sendText({ to, body, phoneNumberId = null }) {
   const phoneId = phoneNumberId || WA_PHONE_ID;
   if (!WA_TOKEN || !phoneId) throw new Error('Missing WA_TOKEN or WA_PHONE_ID');
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
-  const payload = { messaging_product: 'whatsapp', to, type: 'text', text: { body } };
+  const payload = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'text',
+    text: { body },
+  };
   const res = await fetch(url, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' },
+    headers: {
+      Authorization: `Bearer ${WA_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
     body: JSON.stringify(payload),
   });
   const json = await res.json().catch(() => ({}));
@@ -186,19 +258,32 @@ async function sendText({ to, body, phoneNumberId = null }) {
   return json;
 }
 
+// ---- Helpers ----
+function normalizeMsisdn(msisdn) {
+  if (!msisdn) return null;
+  if (msisdn.startsWith('+')) return msisdn;
+  // WhatsApp 'from' is usually without '+' but in E.164 digits; add '+' heuristically
+  if (/^\d+$/.test(msisdn)) return '+' + msisdn;
+  return msisdn;
+}
+function toTimestamp(epochSecString) {
+  const n = Number(epochSecString);
+  if (!Number.isFinite(n)) return null;
+  return new Date(n * 1000).toISOString();
+}
+
 // ---- Boot ----
 (async () => {
   if (pool) {
     try {
       await pool.query('select 1');
       log('info', '[DB] Connected');
-      await ensureInboxSchema();
     } catch (e) {
       log('warn', '[DB] connection failed', { error: e.message });
     }
   }
   app.listen(PORT, () => {
-    log('info', `[BOOT] MIN webhook listening on :${PORT} (file: ${__filename})`);
+    log('info', `[BOOT] PROVIDER webhook listening on :${PORT} (file: ${__filename})`);
   });
 })();
 
