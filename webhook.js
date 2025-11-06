@@ -1,46 +1,29 @@
 require('dotenv').config();
-
 const express = require('express');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-
-// dynamiczny import node-fetch (dziala na Node 16+; na Node 18+ jest global fetch)
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const app = express();
 app.use((req, res, next) => {
   let data = [];
   req.on('data', chunk => data.push(chunk));
-  req.on('end', () => {
-    req.rawBody = Buffer.concat(data);
-    next();
-  });
-})
-app.use(express.json({
-  verify: (req, res, buf) => {
-    // jesli rawBody nie zlapal sie wyzej, zlap tu
-    if (!req.rawBody) req.rawBody = Buffer.from(buf);
-  }
-}));
+  req.on('end', () => { req.rawBody = Buffer.concat(data); next(); });
+});
+app.use(express.json({ verify: (req, res, buf) => { if (!req.rawBody) req.rawBody = Buffer.from(buf); } }));
 
-/* =========================
-   ENV / KONFIG
-   ========================= */
+// =========================
+// ENV / KONFIG
+// =========================
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const APP_SECRET = process.env.APP_SECRET || '';
-const WA_TOKEN     = process.env.WHATSAPP_TOKEN || null;
-const WA_PHONE_ID  = process.env.WHATSAPP_PHONE_NUMBER_ID || null;
-const TEMPLATE_LANG               = process.env.TEMPLATE_LANG || 'pl';
-const OUTBOUND_MAX_RETRIES   = Math.max(0, Number(process.env.OUTBOUND_MAX_RETRIES ?? 3));
-const OUTBOUND_RETRY_BASE_MS = Math.max(100, Number(process.env.OUTBOUND_RETRY_BASE_MS ?? 800));
+const WA_TOKEN = process.env.WHATSAPP_TOKEN || null;
+const WA_PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || null;
 const DEBUG = String(process.env.DEBUG || '0') === '1';
 
 const pool = new Pool(
   process.env.DATABASE_URL
-    ? {
-        connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false }   // << wymagane na Render
-      }
+    ? { connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }
     : {
         user: process.env.DB_USER || 'booking_user',
         host: process.env.DB_HOST || 'localhost',
@@ -50,1103 +33,130 @@ const pool = new Pool(
       }
 );
 
-async function auditOutbound({ user_id, to_phone, message_type, body, template_name, variables, status, reason, wa_message_id }) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `INSERT INTO outbound_messages
-       (user_id, to_phone, message_type, body, template_name, variables, status, reason, wa_message_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [user_id || null, to_phone, message_type, body || null, template_name || null,
-       variables ? JSON.stringify(variables) : null, status, reason || null, wa_message_id || null]
-    );
-  } finally { client.release(); }
-}
-
-/* =========================
-   FRAZY / INTENCJE
-   ========================= */
-const RESERVATION_KEYWORDS = [
-  'rezerwuję','rezerwuje','rezerwuj',
-  'zapisz','zapisuję','zapisuje',
-  'chcę miejsce','chce miejsce',
-  'biorę miejsce','biore miejsce',
-  'wchodzę','wchodze','wpadam'
-];
-
-const ABSENCE_KEYWORDS = [
-  'nie będzie mnie','nie bedzie mnie',
-  'odwołuję','odwoluje',
-  'rezygnuję','rezygnuje',
-  'nie dam rady','nie przyjdę','nie przyjde'
-];
-
-const PERIOD_KEYWORDS = [
-  { re: /\b(do końca tygodnia)\b/, days: 'end_of_week' },
-  { re: /\b(cały tydzień|tydzień)\b/, days: 7 },
-  { re: /\b(dwa tygodnie)\b/, days: 14 },
-  { re: /\b(miesiac|miesiąc)\b/, days: 30 }
-];
-
-const MONTHS_GEN = {
-  'stycznia':1,'lutego':2,'marca':3,'kwietnia':4,'maja':5,'czerwca':6,
-  'lipca':7,'sierpnia':8,'wrzesnia':9,'pazdziernika':10,'listopada':11,'grudnia':12
-};
-
-const DOW_ISO = {
-  // mianownik + przypadki spotykane w mowie pisanej
-  'poniedzialek':1, 'poniedzialku':1,
-  'wtorek':2,       'wtorku':2,
-  'sroda':3,        'srode':3, 'srody':3,
-  'czwartek':4,     'czwartku':4,
-  'piatek':5,       'piatku':5,
-  'sobota':6,       'sobote':6, 'soboty':6,
-  'niedziela':7,    'niedziele':7, 'niedzieli':7
-};
-
-/* =========================
-   UTILS
-   ========================= */
-function normalize(s = '') {
-  return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-}
-function formatYMD(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${dd}`;
-}
-function formatHumanDate(ymd) {
-  if (!ymd) return '';
-  const [y, m, d] = ymd.split('-');
-  return `${d}.${m}.${y}`;
-}
-function formatHumanTime(hhmm) {
-  return hhmm ? hhmm : '(bez godz.)';
-}
-
-// Parser daty/godziny: dzis/jutro/pojutrze, dd.mm(.yyyy), HH:MM
-function parseDateTime(text) {
-  if (!text) return { session_date: null, session_time: null };
-  const t = normalize(text);
-
-  const now = new Date();
-  let target = new Date(now);
-  let timeHH = null, timeMM = null;
-
-  if (/\bpojutrze\b/.test(t)) {
-    target.setDate(target.getDate() + 2);
-  } else if (/\bjutro\b/.test(t)) {
-    target.setDate(target.getDate() + 1);
-  } else if (/\bdzis(iaj)?\b/.test(t)) {
-    // zostaje dziś
-  }
-
-  const dateMatch = t.match(/\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b/);
-  if (dateMatch) {
-    let [_, d, m, y] = dateMatch;
-    d = parseInt(d, 10);
-    m = parseInt(m, 10);
-    if (!y) {
-      y = now.getFullYear();
-    } else {
-      y = parseInt(y, 10);
-      if (y < 100) y += 2000;
-    }
-    target = new Date(y, m - 1, d);
-  }
-  
-  // "1 pazdziernika" / "1 wrzesnia" (rok opcjonalny)
-  if (!dateMatch) {
-    const mName = t.match(/\b(\d{1,2})\s+(stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|wrzesnia|pazdziernika|listopada|grudnia)(?:\s+(\d{4}))?\b/);
-    if (mName) {
-      const d  = parseInt(mName[1],10);
-      const mm = MONTHS_GEN[mName[2]];
-      let y    = mName[3] ? parseInt(mName[3],10) : now.getFullYear();
-      let cand = new Date(y, mm-1, d);
-      if (!mName[3] && cand < new Date(now.getFullYear(), now.getMonth(), now.getDate())) {
-        cand = new Date(y+1, mm-1, d); // jeśli już minęła → przyszły rok
-      }
-      target = cand;
-    }
-  }
-
-  // "w środę / w srode" → najbliższe wystąpienie
-  if (!dateMatch) {
-    const mDow = t.match(/\bw\s+(poniedzialek|wtorek|sroda|srode|czwartek|piatek|sobota|sobote|niedziela|niedziele)\b/);
-    if (mDow) {
-      const wantIso  = DOW_ISO[mDow[1]];
-      const todayIso = ((now.getDay() + 6) % 7) + 1; // ISO 1..7
-      let add = (wantIso - todayIso + 7) % 7;
-      if (add === 0) add = 7; // nie dziś, tylko następny taki dzień
-      target = new Date(now);
-      target.setDate(now.getDate() + add);
-    }
-  }
-  
-  for (const p of PERIOD_KEYWORDS) {
-    if (p.re.test(t)) {
-      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      if (p.days === 'end_of_week') {
-        const iso = ((now.getDay()+6)%7)+1; const add = 7-iso;
-        return { from: today, to: new Date(today.getFullYear(), today.getMonth(), today.getDate()+add) };
-      }
-      return { from: today, to: new Date(today.getFullYear(), today.getMonth(), today.getDate()+p.days) };
-    }
-  }
-
-  // --- "do dd[.:/-]mm[.yyyy]"  → zakres od dziś do wskazanej daty (włącznie)
-  {
-    const mNum = t.match(/\bdo\s+(\d{1,2})[\.:\-\/](\d{1,2})(?:[\.:\-\/](\d{2,4}))?\b/);
-    if (mNum) {
-      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const dd = parseInt(mNum[1],10), mm = parseInt(mNum[2],10);
-      let yy = mNum[3] ? (Number(mNum[3]) < 100 ? 2000 + Number(mNum[3]) : Number(mNum[3])) : now.getFullYear();
-      let to = new Date(yy, mm-1, dd);
-      if (!mNum[3] && to < today) to = new Date(yy+1, mm-1, dd);
-      return { from: today, to };
-    }
-  }
-
-  // --- "do 20 pazdziernika" (gen.)  → zakres od dziś do wskazanej daty (włącznie)
-  {
-    const mName = t.match(/\bdo\s+(\d{1,2})\s+(stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|wrzesnia|pazdziernika|listopada)(?:\s+(\d{4}))?\b/);
-    if (mName) {
-      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const dd = parseInt(mName[1],10), mm = MONTHS_GEN[mName[2]];
-      let yy = mName[3] ? Number(mName[3]) : now.getFullYear();
-      let to = new Date(yy, mm-1, dd);
-      if (!mName[3] && to < today) to = new Date(yy+1, mm-1, dd);
-      return { from: today, to };
-    }
-  }
-
-  const colonTimes = [...t.matchAll(/\b(\d{1,2}):(\d{2})\b/g)];
-  if (colonTimes.length) {
-    const last = colonTimes.at(-1);
-    timeHH = parseInt(last[1], 10);
-    timeMM = parseInt(last[2], 10);
-  } else {
-    const dotTime = t.match(/\b(?:godz(?:ina)?\s*|o\s+)(\d{1,2})\.(\d{2})\b/);
-    if (dotTime) {
-      timeHH = parseInt(dotTime[1], 10);
-      timeMM = parseInt(dotTime[2], 10);
-    }
-  }
-
-  return {
-    session_date: formatYMD(target),
-    session_time: timeHH != null ? `${String(timeHH).padStart(2,'0')}:${String(timeMM ?? 0).padStart(2,'0')}` : null
-  };
-}
-
-function isReservationIntent(text) {
-  const t = normalize(text || '');
-  return RESERVATION_KEYWORDS.some(k => t.includes(normalize(k)));
-}
-function isAbsenceIntent(text) {
-  const t = normalize(text || '');
-  return ABSENCE_KEYWORDS.some(k => t.includes(normalize(k)));
-}
-
-// okno 24h (przy zwykłych odpowiedziach)
-function within24h(dateObj) {
-  if (!dateObj) return true;
-  const diffMs = Date.now() - dateObj.getTime();
-  return diffMs <= 24 * 60 * 60 * 1000;
-}
-
-// pauzy / sleep
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// === Unified WhatsApp outbound core (text + template) ===
-
-function resolvePhoneId(overrideId) {
-  return overrideId || WA_PHONE_ID || null;
-}
-function normalizeTo(to) {
-  return String(to).replace(/^\+/, '');
-}
-
-async function postWA({ phoneId, payload, idempotencyKey }) {
-  if (!WA_TOKEN || !phoneId) {
-    return { ok: false, reason: 'missing_config' };
-  }
-
+// =========================
+// UTILS
+// =========================
+function normalizeTo(to) { return String(to).replace(/^\+/, ''); }
+async function postWA({ phoneId, payload }) {
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
   const headers = { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' };
-  if (idempotencyKey) headers['X-Idempotency-Key'] = idempotencyKey;
-
-  let attempt = 0;
-  while (true) {
-    attempt += 1;
-    try {
-      const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
-      if (resp.ok) {
-        const data = await resp.json().catch(() => ({}));
-        return { ok: true, data, attempt };
-      }
-
-      const status = resp.status;
-      const text = await resp.text().catch(() => '');
-      const data = (() => { try { return JSON.parse(text); } catch { return { raw: text }; } })();
-
-      const is5xx = status >= 500 && status <= 599;
-      const is408 = status === 408;
-      const is429 = status === 429;
-
-      if ((is5xx || is408 || is429) && attempt <= OUTBOUND_MAX_RETRIES) {
-        let delay = Math.floor(OUTBOUND_RETRY_BASE_MS * Math.pow(2, attempt - 1));
-        delay += Math.floor(delay * Math.random() * 0.3);
-        if (is429) {
-          const ra = resp.headers.get('retry-after');
-          const raMs = ra ? Number(ra) * 1000 : NaN;
-          if (!Number.isNaN(raMs) && raMs > 0) delay = Math.max(delay, raMs);
-        }
-        await sleep(delay);
-        continue;
-      }
-
-      return { ok: false, status, data, attempt };
-    } catch (e) {
-      const msg = String(e?.message || e);
-      const retriable = /(timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|network|fetch failed)/i.test(msg);
-      if (retriable && attempt <= OUTBOUND_MAX_RETRIES) {
-        let delay = Math.floor(OUTBOUND_RETRY_BASE_MS * Math.pow(2, attempt - 1));
-        delay += Math.floor(delay * Math.random() * 0.3);
-        await sleep(delay);
-        continue;
-      }
-      return { ok: false, reason: 'exception', error: msg, attempt };
-    }
-  }
+  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+  return { ok: resp.ok, status: resp.status, data: await resp.json().catch(() => ({})) };
+}
+async function sendText({ to, body }) {
+  const payload = { messaging_product: 'whatsapp', to: normalizeTo(to), type: 'text', text: { body } };
+  await postWA({ phoneId: WA_PHONE_ID, payload });
 }
 
-// Tekst
-async function sendText({ to, body, phoneNumberId = null, idempotencyKey = null }) {
-  const phoneId = resolvePhoneId(phoneNumberId);
-  const toNorm  = normalizeTo(to);
-
-  if (!WA_TOKEN || !phoneId) {
-    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'text', body, status: 'skipped', reason: 'missing_credentials' });
-    return { ok: false, reason: 'missing_config' };
-  }
-
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: toNorm,
-    type: 'text',
-    text: { body }
-  };
-
-  await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'text', body, status: 'queued' });
-  const res = await postWA({ phoneId, payload, idempotencyKey });
-
-  if (res.ok) {
-    const waId = res?.data?.messages?.[0]?.id || null;
-    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'text', body, status: 'sent', wa_message_id: waId });
-  } else {
-    const reason = res.reason || (res.status ? `http_${res.status}` : 'unknown');
-    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'text', body, status: 'error', reason });
-  }
-  return res;
-}
-
-// Template
-async function sendTemplate({ to, templateName, lang = (TEMPLATE_LANG || 'pl'), components = [], phoneNumberId = null, idempotencyKey = null }) {
-  const phoneId = resolvePhoneId(phoneNumberId);
-  const toNorm  = normalizeTo(to);
-
-  if (!WA_TOKEN || !phoneId) {
-    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'template', template_name: templateName, variables: components, status: 'skipped', reason: 'missing_credentials' });
-    return { ok: false, reason: 'missing_config' };
-  }
-
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: toNorm,
-    type: 'template',
-    template: { name: templateName, language: { code: lang }, components }
-  };
-
-  await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'template', template_name: templateName, variables: components, status: 'queued' });
-  const res = await postWA({ phoneId, payload, idempotencyKey });
-
-  if (res.ok) {
-    const waId = res?.data?.messages?.[0]?.id || null;
-    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'template', template_name: templateName, variables: components, status: 'sent', wa_message_id: waId });
-  } else {
-    const reason = res.reason || (res.status ? `http_${res.status}` : 'unknown');
-    await auditOutbound({ user_id: null, to_phone: toNorm, message_type: 'template', template_name: templateName, variables: components, status: 'error', reason });
-  }
-  return res;
-}
-
-// Szablony (business-initiated) – z retry/backoff
-
-/* =========================
-   MAPOWANIE WIADOMOŚCI / STATUSÓW
-   ========================= */
-function mapWhatsAppMessageToRecord(message, value) {
-  const m = message || {};
-  const ts = m.timestamp ? new Date(Number(m.timestamp) * 1000) : null;
-  const displayNumber = value?.metadata?.display_phone_number || null;
-  const phoneNumberId  = value?.metadata?.phone_number_id || null;
-
-  const txt =
-    m.text?.body ||
-    m.button?.text ||
-    m.interactive?.button_reply?.title ||
-    m.interactive?.list_reply?.title ||
-    null;
-
-  return {
-    source: 'whatsapp',
-    provider_uid: m.id,
-    provider_message_id: m.id,
-    message_direction: 'inbound',
-    message_type: m.type || 'unknown',
-    from_wa_id: m.from || null,
-    from_msisdn: m.from ? `+${String(m.from).replace(/^\+?/, '')}` : null,
-    to_msisdn: displayNumber || phoneNumberId || null,
-    text_body: txt,
-    status: null,
-    error_code: null,
-    error_title: null,
-    sent_ts: ts,
-    payload_json: m,
-  };
-}
-
-function mapWhatsAppStatusToRecord(statusObj, value) {
-  const s = statusObj || {};
-  const ts = s.timestamp ? new Date(Number(s.timestamp) * 1000) : null;
-  const displayNumber = value?.metadata?.display_phone_number || null;
-  const phoneNumberId  = value?.metadata?.phone_number_id || null;
-
-  // idempotencja: (id:status:timestamp)
-  const pid = `${s.id || 'unknown'}:${s.status || 'unknown'}:${s.timestamp || '0'}`;
-
-  return {
-    source: 'whatsapp',
-    provider_uid: pid,
-    provider_message_id: s.id || null,
-    message_direction: 'inbound',
-    message_type: 'status',
-    from_wa_id: s.recipient_id || null,
-    from_msisdn: s.recipient_id ? `+${String(s.recipient_id).replace(/^\+?/, '')}` : null,
-    to_msisdn: displayNumber || phoneNumberId || null,
-    text_body: null,
-    status: s.status || null,
-    error_code: s.errors?.[0]?.code || null,
-    error_title: s.errors?.[0]?.title || null,
-    sent_ts: ts,
-    payload_json: s,
-  };
-}
-
-/* =========================
-   DB HELPERS
-   ========================= */
+// =========================
+// DB HELPERS
+// =========================
 async function insertInboxRecord(client, rec) {
-  const sql = `
-    INSERT INTO inbox_messages (
-      source, provider_uid, provider_message_id, message_direction, message_type,
-      from_wa_id, from_msisdn, to_msisdn, text_body, status, error_code, error_title, sent_ts, payload_json
-    ) VALUES (
-      $1,$2,$3,$4,$5,
-      $6,$7,$8,$9,$10,$11,$12,$13,$14
-    )
-    ON CONFLICT (source, provider_uid) DO NOTHING
-    RETURNING id;
-  `;
-  const params = [
-    rec.source, rec.provider_uid, rec.provider_message_id,
-    rec.message_direction, rec.message_type,
-    rec.from_wa_id, rec.from_msisdn, rec.to_msisdn,
-    rec.text_body, rec.status, rec.error_code, rec.error_title,
-    rec.sent_ts, rec.payload_json
-  ];
-  const res = await client.query(sql, params);
-  return { inserted: res.rows.length > 0, id: res.rows[0]?.id || null };
+  const sql = `INSERT INTO inbox_messages
+    (source, provider_uid, message_direction, message_type, from_wa_id, text_body, sent_ts, payload_json)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    ON CONFLICT DO NOTHING;`;
+  await client.query(sql, [
+    rec.source, rec.provider_uid, rec.message_direction, rec.message_type,
+    rec.from_wa_id, rec.text_body, rec.sent_ts, rec.payload_json
+  ]);
 }
 
-async function resolveUserIdByWa(client, wa) {
-  if (!wa) return null;
+// --- helper: identyfikacja nadawcy ---
+async function resolveSenderType(client, wa) {
+  if (!wa) return { type: 'none' };
   const waBare = String(wa).replace(/^\+?/, '');
   const waPlus = '+' + waBare;
-  const sql = `
-    SELECT id
-    FROM public.users
-    WHERE phone_e164 = $1
-       OR phone_raw  = $2
-       OR phone_raw  = $1
-    ORDER BY id
-    LIMIT 1
-  `;
-  const res = await client.query(sql, [waPlus, waBare]);
-  return res.rows[0]?.id ?? null;
+
+  const u = await client.query(
+    `SELECT id, first_name AS name, active FROM public.users 
+     WHERE phone_e164=$1 OR phone_raw=$2 OR phone_raw=$1 LIMIT 1`,
+    [waPlus, waBare]
+  );
+  if (u.rowCount > 0) return { type: 'user', ...u.rows[0] };
+
+  const i = await client.query(
+    `SELECT id, first_name AS name FROM public.instructors 
+     WHERE phone_e164=$1 OR phone_raw=$2 OR phone_raw=$1 LIMIT 1`,
+    [waPlus, waBare]
+  );
+  if (i.rowCount > 0) return { type: 'instructor', ...i.rows[0], active: true };
+
+  return { type: 'none' };
 }
 
-async function resolveClassTemplateIdBySlot(client, ymd /* 'YYYY-MM-DD' */) {
-  if (!ymd) return { ok: false, reason: 'missing_date' };
-
-  // 1) preferuj dokładnie 1 open slot
-  const open = await client.query(`
-    SELECT DISTINCT class_template_id
-    FROM public.slots
-    WHERE session_date = $1::date
-      AND status = 'open'
-  `, [ymd]);
-
-  if (open.rows.length === 1) {
-    return { ok: true, class_template_id: open.rows[0].class_template_id, via: 'open_slot_unique' };
-  }
-  if (open.rows.length > 1) {
-    return { ok: false, reason: 'ambiguous_slots_open' };
-  }
-
-  // 2) jeśli nie ma open, sprawdź wszystkie sloty danego dnia
-  const any = await client.query(`
-    SELECT DISTINCT class_template_id
-    FROM public.slots
-    WHERE session_date = $1::date
-  `, [ymd]);
-
-  if (any.rows.length === 1) {
-    return { ok: true, class_template_id: any.rows[0].class_template_id, via: 'day_unique_class' };
-  }
-  if (any.rows.length === 0) {
-    return { ok: false, reason: 'no_slot_for_date' };
-  }
-  return { ok: false, reason: 'ambiguous_slots_any' };
-}
-
-async function resolveClassTemplateIdForAbsence(client, { user_id, session_date, session_time }) {
-  if (!session_date) return { ok:false, reason:'missing_session_date' };
-
-  // CASE A: mamy godzinę → najpierw klasy z takim start_time w danym dniu
-  if (session_time) {
-    // kandydaci wg rozkładu
-    const cand = await client.query(`
-      SELECT ct.id
-      FROM public.class_templates ct
-      JOIN public.groups g ON g.id = ct.group_id
-      WHERE ct.is_active = true AND g.is_active = true
-        AND ct.weekday_iso = EXTRACT(ISODOW FROM $1::date)::int
-        AND ct.start_time  = $2::time
-    `, [session_date, session_time]);
-
-    if (cand.rowCount === 1) {
-      return { ok:true, class_template_id: cand.rows[0].id, via:'ct_by_time' };
-    }
-    if (cand.rowCount > 1) {
-      // spróbuj ograniczyć do enrollmentów użytkownika
-      const byEnr = await client.query(`
-        SELECT ct.id
-        FROM public.class_templates ct
-        JOIN public.groups g ON g.id = ct.group_id
-        JOIN public.enrollments e ON e.class_template_id = ct.id
-        WHERE ct.is_active = true AND g.is_active = true
-          AND e.user_id = $1
-          AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
-          AND ct.start_time  = $3::time
-      `, [user_id, session_date, session_time]);
-
-      if (byEnr.rowCount === 1) {
-        return { ok:true, class_template_id: byEnr.rows[0].id, via:'enrollment_by_time' };
-      }
-      return { ok:false, reason:'ambiguous_day_requires_time' };
-    }
-    // 0 kandydatów z takim czasem
-    return { ok:false, reason:'no_slot_for_date' };
-  }
-
-  // CASE B: brak godziny → najpierw enrollmenty usera w tym dniu tygodnia
-  const enr = await client.query(`
-    SELECT ct.id
-    FROM public.enrollments e
-    JOIN public.class_templates ct ON ct.id = e.class_template_id
-    JOIN public.groups g ON g.id = ct.group_id
-    WHERE e.user_id = $1
-      AND ct.is_active = true AND g.is_active = true
-      AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
-  `, [user_id, session_date]);
-
-  if (enr.rowCount === 1) {
-    return { ok:true, class_template_id: enr.rows[0].id, via:'enrollment_by_day' };
-  }
-  if (enr.rowCount > 1) {
-    return { ok:false, reason:'ambiguous_day_requires_time' };
-  }
-
-  // brak enrollmentów — sprawdź, czy jest jedna klasa tego dnia
-  const onlyCt = await client.query(`
-    SELECT ct.id
-    FROM public.class_templates ct
-    JOIN public.groups g ON g.id = ct.group_id
-    WHERE ct.is_active = true AND g.is_active = true
-      AND ct.weekday_iso = EXTRACT(ISODOW FROM $1::date)::int
-  `, [session_date]);
-
-  if (onlyCt.rowCount === 1) {
-    return { ok:true, class_template_id: onlyCt.rows[0].id, via:'ct_by_day' };
-  }
-  if (onlyCt.rowCount === 0) {
-    return { ok:false, reason:'no_slot_for_date' };
-  }
-  return { ok:false, reason:'ambiguous_day_requires_time' };
-}
-
-// sprawdza: user.level_id ≥ group.level_id oraz max_home_price ≥ cena zajęć
-async function checkReservationEligibility(client, userId, classTemplateId) {
-  const q = `
-    SELECT 
-      u.level_id            AS user_level,
-      v.max_home_price      AS max_home_price,
-      g.level_id            AS required_level,
-      pt.per_session_price  AS class_price
-    FROM public.users u
-    LEFT JOIN public.v_user_home_price v ON v.user_id = u.id
-    JOIN public.class_templates ct ON ct.id = $2
-    JOIN public.groups g          ON g.id = ct.group_id
-    JOIN public.price_tiers pt    ON pt.id = g.price_tier_id
-    WHERE u.id = $1
-    LIMIT 1
-  `;
-  const { rows } = await client.query(q, [userId, classTemplateId]);
-  if (!rows.length) return { ok:false, reason:'missing_user_or_class' };
-  const r = rows[0];
-  if (r.user_level < r.required_level) return { ok:false, reason:'level_too_low', req:r.required_level, have:r.user_level };
-  if (r.max_home_price == null)       return { ok:false, reason:'no_home_price' };
-  if (Number(r.max_home_price) < Number(r.class_price)) 
-    return { ok:false, reason:'price_too_low', need:r.class_price, have:r.max_home_price };
-  return { ok:true };
-}
-
-async function ensureOpenSlotForAbsence(client, absenceId, classTemplateId, ymd) {
-  if (!absenceId || !classTemplateId || !ymd) return { created: false, reason: 'missing_params' };
-  const sql = `
-    INSERT INTO public.slots (class_template_id, session_date, source_absence_id, status)
-    VALUES ($1, $2::date, $3, 'open')
-    ON CONFLICT (source_absence_id) DO NOTHING
-    RETURNING id;
-  `;
-  const { rows } = await client.query(sql, [classTemplateId, ymd, absenceId]);
-  return { created: !!rows.length, slot_id: rows[0]?.id || null };
-}
-
-async function insertAbsenceRangeIfPossible(client, { userId, fromDate, toDate, session_time }) {
-  let inserted = 0, skipped = 0;
-  const start = new Date(fromDate);
-  const end   = new Date(toDate);
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate()+1)) {
-    const ymd = formatYMD(d);
-    const r = await resolveClassTemplateIdForAbsence(client, {
-      user_id: userId,
-      session_date: ymd,
-      session_time: session_time || null
-    });
-    if (!r.ok) { skipped++; continue; }
-
-    const classTemplateId = r.class_template_id;
-    const ins = await client.query(
-      `INSERT INTO public.absences (user_id, class_template_id, session_date, reason)
-       VALUES ($1,$2,$3::date,$4)
-       ON CONFLICT (user_id, class_template_id, session_date)
-       DO UPDATE SET reason = EXCLUDED.reason, updated_at = NOW()
-       RETURNING id;`,
-      [userId, classTemplateId, ymd, 'range']
-    );
-    const absenceId = ins.rows[0]?.id || null;
-    await ensureOpenSlotForAbsence(client, absenceId, classTemplateId, ymd);
-    inserted++;
-  }
-  return { inserted, skipped, range: true };
-}
-
-async function insertAbsenceIfPossible(client, candidate, fromWaId) {
-  const userId = await resolveUserIdByWa(client, fromWaId);
-  if (!userId) return { inserted: false, reason: 'missing_user_mapping', fromWaId };
-
-  if (candidate?.date_from && candidate?.date_to) {
-    return await insertAbsenceRangeIfPossible(client, {
-      userId,
-      fromDate: candidate.date_from,
-      toDate:   candidate.date_to,
-      session_time: candidate.session_time || null
-    });
-  }
-
-  if (!candidate?.session_date && !(candidate.date_from && candidate.date_to)) {
-    return { inserted: false, reason: 'missing_session_date' };
-  }
-
-  const r = await resolveClassTemplateIdForAbsence(client, {
-    user_id: userId,
-    session_date: candidate.session_date,
-    session_time: candidate.session_time
-  });
-  if (!r.ok) return { inserted: false, reason: r.reason || 'missing_class_template_id' };
-  const classTemplateId = r.class_template_id;
-
-  const sql = `
-    INSERT INTO public.absences (user_id, class_template_id, session_date, reason)
-    VALUES ($1, $2, $3::date, $4)
-    ON CONFLICT (user_id, class_template_id, session_date)
-    DO UPDATE SET reason = EXCLUDED.reason, updated_at = NOW()
-    RETURNING id;
-  `;
-  const params = [userId, classTemplateId, candidate.session_date, candidate.reason];
-  const { rows } = await client.query(sql, params);
-  const absenceId = rows[0]?.id;
-
-  const slot = await ensureOpenSlotForAbsence(client, absenceId, classTemplateId, candidate.session_date);
-
-  return {
-    inserted: !!rows.length,
-    absence_id: absenceId || null,
-    user_id: userId,
-    class_template_id: classTemplateId,
-    via: r.via || 'slot_match',
-    slot_created: slot.created,
-    slot_id: slot.slot_id || null,
-  };
-}
-
-async function reserveOpenSlot(client, { user_id, class_template_id, session_date, session_time }) {
-  await client.query('BEGIN');
-  try {
-    let res;
-
-    if (session_time) {
-      res = await client.query(
-        `
-          SELECT s.id
-          FROM public.slots AS s
-          JOIN public.class_templates AS ct
-            ON ct.id = s.class_template_id
-          WHERE s.class_template_id = $1
-            AND s.session_date     = $2
-            AND s.status           = 'open'
-            AND ct.start_time      = $3::time
-          ORDER BY ct.start_time NULLS LAST, s.id
-          FOR UPDATE OF s SKIP LOCKED
-          LIMIT 1
-        `,
-        [class_template_id, session_date, session_time]
-      );
-
-      if (res.rowCount === 0) {
-        await client.query('ROLLBACK');
-        return { ok: false, reason: 'no_slot_for_time' };
-      }
-    } else {
-      const allOpen = await client.query(
-        `
-          SELECT s.id, ct.start_time AS session_time
-          FROM public.slots AS s
-          JOIN public.class_templates AS ct
-            ON ct.id = s.class_template_id
-          WHERE s.class_template_id = $1
-            AND s.session_date     = $2
-            AND s.status           = 'open'
-          ORDER BY ct.start_time NULLS LAST, s.id
-          FOR UPDATE OF s SKIP LOCKED
-        `,
-        [class_template_id, session_date]
-      );
-
-      if (allOpen.rowCount === 0) {
-        await client.query('ROLLBACK');
-        return { ok: false, reason: 'no_open_slot_for_date' };
-      }
-      if (allOpen.rowCount > 1) {
-        await client.query('ROLLBACK');
-        return { ok: false, reason: 'ambiguous_day_requires_time' };
-      }
-
-      res = { rowCount: 1, rows: [ { id: allOpen.rows[0].id } ] };
-    }
-
-    const slotId = res.rows[0].id;
-
-    const dup = await client.query(
-      `
-        SELECT 1
-        FROM public.slots
-        WHERE class_template_id = $1
-          AND session_date      = $2
-          AND taken_by_user_id  = $3
-          AND status            = 'taken'
-        LIMIT 1
-      `,
-      [class_template_id, session_date, user_id]
-    );
-    if (dup.rowCount > 0) {
-      await client.query('ROLLBACK');
-      return { ok: true, slot_id: slotId, via: 'already_taken_by_user' };
-    }
-
-    const upd = await client.query(
-      `
-        UPDATE public.slots
-        SET status = 'taken',
-            taken_by_user_id = $1,
-            taken_at = NOW()
-        WHERE id = $2
-          AND status = 'open'
-        RETURNING id
-      `,
-      [user_id, slotId]
-    );
-
-    if (upd.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return { ok: false, reason: 'race_lost' };
-    }
-
-    await client.query('COMMIT');
-    return { ok: true, slot_id: slotId, via: 'reserved' };
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  }
-}
-
-async function sendUnrecognizedAck({ to, phoneNumberId = null, idempotencyKey = null }) {
-  const body = '📩 Dziękujemy za wiadomość';
-  return sendText({ to, body, phoneNumberId, idempotencyKey });
-}
-
-/* =========================
-   WHATSAPP WEBHOOK
-   ========================= */
+// =========================
+// WHATSAPP WEBHOOK
+// =========================
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    if (DEBUG) console.log('[WEBHOOK HIT]', req.rawBody?.length);
-    return res.status(200).send(challenge);
-  }
-  if (DEBUG) console.log('[WEBHOOK HIT]', req.rawBody?.length);
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// (opcjonalnie) podpis X-Hub-Signature-256
-
 app.post('/webhook', async (req, res) => {
-  // (opcjonalnie) wymuś podpis, jeśli APP_SECRET jest ustawiony
   if (APP_SECRET) {
-    const sigHeader = req.get('x-hub-signature-256') || '';
-    const [prefix, sigHex] = sigHeader.split('=');
-
-    if (prefix !== 'sha256' || !sigHex) return res.status(403).send('Missing signature');
-
-    const expectedHex = crypto.createHmac('sha256', APP_SECRET).update(req.rawBody || Buffer.from([])).digest('hex');
-    const a = Buffer.from(sigHex, 'hex');
-    const b = Buffer.from(expectedHex, 'hex');
-    if (a.length !== b.length) return res.status(403).send('Bad signature');
-    const ok = crypto.timingSafeEqual(a, b);
-    if (!ok) return res.status(403).send('Bad signature');
-  }
-    
-  let body;
-  try {
-    if (req.body && Object.keys(req.body).length) {
-      body = req.body;
-    } else if (req.rawBody?.length) {
-      body = JSON.parse(req.rawBody.toString('utf8'));
-    } else {
-      body = null;
-    }
-  } catch (e) {
-    console.error('[WEBHOOK RAW JSON PARSE ERROR]', e?.message);
-    return res.status(400).send('Bad JSON');
+    const sig = req.get('x-hub-signature-256') || '';
+    const [prefix, hex] = sig.split('=');
+    const expected = crypto.createHmac('sha256', APP_SECRET).update(req.rawBody || Buffer.from([])).digest('hex');
+    if (prefix !== 'sha256' || !hex || !crypto.timingSafeEqual(Buffer.from(hex, 'hex'), Buffer.from(expected, 'hex')))
+      return res.status(403).send('Bad signature');
   }
 
-  if (!body || !Array.isArray(body.entry)) {
-    if (DEBUG) console.log('[WEBHOOK HIT]', req.rawBody?.length);
-    return res.sendStatus(200);
-  }
+  const body = req.body;
+  if (!body?.entry) return res.sendStatus(200);
 
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-
     for (const entry of body.entry) {
       const changes = entry?.changes || [];
       for (const ch of changes) {
         const v = ch?.value || {};
-        const phoneNumberIdFromHook = v?.metadata?.phone_number_id || null;
-                
-        // messages
-        if (Array.isArray(v.messages)) {
-          for (const m of v.messages) {
-            const rec = mapWhatsAppMessageToRecord(m, v);
-            const ins = await insertInboxRecord(client, rec);
-            if (!ins.inserted) continue; // duplikat dostawy → nie odpowiadamy ponownie
+        if (!Array.isArray(v.messages)) continue;
 
-            const text = rec.text_body || '';
-            if (!text) continue;
+        for (const m of v.messages) {
+          const rec = {
+            source: 'whatsapp',
+            provider_uid: m.id,
+            message_direction: 'inbound',
+            message_type: m.type,
+            from_wa_id: m.from,
+            text_body: m.text?.body || '',
+            sent_ts: new Date(Number(m.timestamp) * 1000),
+            payload_json: m
+          };
+          await insertInboxRecord(client, rec);
 
-            const canReplyNow = within24h(rec.sent_ts);
+          const sender = await resolveSenderType(client, m.from);
 
-            // guard: nieznany użytkownik → grzeczny komunikat i koniec
-            const knownUserId = await resolveUserIdByWa(client, rec.from_wa_id);
-            if (!knownUserId) {
-              if (canReplyNow) {
-                await sendText({
-                  to: rec.from_wa_id,
-                  body: '📩 Otrzymaliśmy Twoją wiadomość, ale ten numer nie jest przypisany do żadnego uczestnika. Skontaktuj się z administratorem, aby dodać numer do systemu.',
-                  phoneNumberId: phoneNumberIdFromHook,
-                  idempotencyKey: `${rec.provider_message_id}:unknown_user`
-                });
-              }
-              continue;
-            }
-
-            // REZERWACJA
-            if (isReservationIntent(text)) {
-              const { session_date, session_time } = parseDateTime(text);
-              if (!session_date) {
-                if (canReplyNow) await sendText({
-                  to: rec.from_wa_id,
-                  body: '❔ Podaj proszę datę (np. 21.09) i ewentualnie godzinę (np. 19:00), żebym mógł zapisać Cię na zajęcia.',
-                  phoneNumberId: phoneNumberIdFromHook,
-                  idempotencyKey: `${rec.provider_message_id}:ask_date_time`
-                });
-                continue;
-              }
-
-              const userId = knownUserId; // już rozpoznany
-              let cls;
-              if (session_time) {
-                const ctByTime = await client.query(`
-                  SELECT ct.id
-                  FROM public.class_templates ct
-                  JOIN public.groups g ON g.id = ct.group_id
-                  WHERE ct.is_active = true AND g.is_active = true
-                    AND ct.weekday_iso = EXTRACT(ISODOW FROM $1::date)::int
-                    AND ct.start_time  = $2::time
-                `, [session_date, session_time]);
-
-                if (ctByTime.rowCount === 1) {
-                  cls = { ok: true, class_template_id: ctByTime.rows[0].id, via: 'ct_by_time' };
-                } else if (ctByTime.rowCount > 1) {
-                  cls = { ok: false, reason: 'ambiguous_by_time' };
-                } else {
-                  cls = await resolveClassTemplateIdBySlot(client, session_date);
-                }
-              } else {
-                cls = await resolveClassTemplateIdBySlot(client, session_date);
-              }
-
-              if (!cls.ok) {
-                if (canReplyNow) {
-                  const why =
-                    (cls.reason === 'ambiguous_slots_open' || cls.reason === 'ambiguous_slots_any')
-                      ? 'tego dnia jest kilka różnych zajęć'
-                      : (cls.reason === 'ambiguous_by_time')
-                        ? 'o tej godzinie są różne zajęcia – podaj proszę nazwę grupy'
-                        : (cls.reason === 'no_slot_for_date')
-                          ? 'tego dnia nie ma żadnych zajęć'
-                          : 'brakuje danych';
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: `❔ Nie mogę rozpoznać zajęć na ${formatHumanDate(session_date)} – ${why}. Podaj proszę dokładną godzinę lub nazwę zajęć.`,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:reservation_disambiguate`
-                  });
-                }
-                continue;
-              }
-
-              const elig = await checkReservationEligibility(client, userId, cls.class_template_id);
-              if (!elig.ok) {
-                if (canReplyNow) {
-                  const msg =
-                    elig.reason === 'level_too_low' ? '❗ Twój poziom jest niższy niż wymagany dla tych zajęć.' :
-                    elig.reason === 'price_too_low' ? '❗ Te zajęcia są droższe niż Twój limit cenowy.' :
-                      '❗ Nie mogę potwierdzić uprawnień do rezerwacji.';
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: msg,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:reservation_not_eligible`
-                  });
-                }
-                continue;
-              }
-
-              const r = await reserveOpenSlot(client, {
-                user_id: userId,
-                class_template_id: cls.class_template_id,
-                session_date,
-                session_time
-              });
-
-              if (canReplyNow) {
-                if (r.ok && r.via === 'reserved') {
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: `✔️ Zarezerwowane: ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}.`,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:reservation_ok`
-                  });
-                } else if (r.ok && r.via === 'already_taken_by_user') {
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: `ℹ️ Już masz rezerwację na ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}.`,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:reservation_already`
-                  });
-                } else if (!r.ok && r.reason === 'no_open_slot_for_date') {
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: `❗ Brak wolnych miejsc na ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}.`,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:reservation_full`
-                  });
-                } else if (!r.ok && r.reason === 'race_lost') {
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: `⚠️ Ktoś właśnie zajął ostatnie miejsce na ${formatHumanDate(session_date)} ${formatHumanTime(session_time)}. Spróbować inny termin?`,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:reservation_race_lost`
-                  });
-                } else {
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: `❗ Nie udało się zapisać. Napisz proszę datę i godzinę – spróbuję ponownie.`,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:reservation_failed`
-                  });
-                }
-              }
-              continue;
-            }
-
-            // ABSENCJA
-            if (isAbsenceIntent(text)) {
-              const dt = parseDateTime(text);
-              const candidate = (dt.from && dt.to)
-                ? {
-                    date_from: formatYMD(dt.from),
-                    date_to:   formatYMD(dt.to),
-                    session_time: dt.session_time || null,
-                    reason: text.trim()
-                  }
-                : {
-                    session_date: dt.session_date,
-                    session_time: dt.session_time,
-                    reason: text.trim()
-                  };
-
-              if (!candidate.session_date && !(candidate.date_from && candidate.date_to)) {
-                if (canReplyNow) await sendText({
-                  to: rec.from_wa_id,
-                  body: '❔ Podaj proszę datę (np. 21.09) i ewentualnie godzinę (np. 19:00), żebym mógł odwołać Twoje miejsce.',
-                  phoneNumberId: phoneNumberIdFromHook,
-                  idempotencyKey: `${rec.provider_message_id}:absence_ask_date`
-                });
-                continue;
-              }
-
-              const result = await insertAbsenceIfPossible(client, candidate, rec.from_wa_id);
-
-              if (canReplyNow) {
-                if (result.inserted) {
-                  const info = (candidate.date_from && candidate.date_to)
-                    ? `od ${formatHumanDate(candidate.date_from)} do ${formatHumanDate(candidate.date_to)}`
-                    : `${formatHumanDate(candidate.session_date)} ${formatHumanTime(candidate.session_time)}`;
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: `✔️ Zgłoszona nieobecność: ${info}. Miejsce oddane do puli.`,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:absence_ok`
-                  });
-                } else if (result.reason === 'missing_user_mapping') {
-                  // (teoretycznie nie trafimy tu, bo mamy guard wyżej)
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: '❗ Nie rozpoznaję Twojego numeru w systemie. Daj znać recepcji, aby Cię dodać.',
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:absence_unknown_user`
-                  });
-                } else if (['ambiguous_slots_open','ambiguous_slots_any','no_slot_for_date','ambiguous_day_requires_time'].includes(result.reason)) {
-                  const why = (result.reason === 'no_slot_for_date')
-                    ? 'tego dnia nie ma żadnych zajęć'
-                    : 'tego dnia jest kilka różnych zajęć';
-                  const dateInfo = (candidate.date_from && candidate.date_to)
-                    ? `zakres ${formatHumanDate(candidate.date_from)}–${formatHumanDate(candidate.date_to)}`
-                    : formatHumanDate(candidate.session_date);
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: `❔ Nie mogę jednoznacznie przypisać zajęć na ${dateInfo} – ${why}. Podaj proszę godzinę lub nazwę zajęć.`,
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:absence_disambiguate`
-                  });
-                } else if (result.reason === 'missing_session_date') {
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: '❔ Podaj proszę datę (np. 21.09), żebym mógł odwołać Twoje miejsce.',
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:absence_missing_date`
-                  });
-                } else {
-                  await sendText({
-                    to: rec.from_wa_id,
-                    body: '❗ Nie udało się odwołać miejsca. Napisz proszę datę i godzinę – spróbuję ponownie.',
-                    phoneNumberId: phoneNumberIdFromHook,
-                    idempotencyKey: `${rec.provider_message_id}:absence_failed`
-                  });
-                }
-              }
-              continue;
-            }
-
-            // --- FALLBACK: potwierdzenie dla nieznanej treści ---------------------------
-            if (canReplyNow && text && !isReservationIntent(text) && !isAbsenceIntent(text)) {
-              await sendUnrecognizedAck({
-                to: rec.from_wa_id,
-                phoneNumberId: phoneNumberIdFromHook,
-                idempotencyKey: `${rec.provider_message_id}:fallback`
-              });
-            }
-          } // end for each message
-        }
-
-        // statuses
-        if (Array.isArray(v.statuses)) {
-          for (const s of v.statuses) {
-            const rec = mapWhatsAppStatusToRecord(s, v);
-            await insertInboxRecord(client, rec);
+          if (sender.type === 'none') {
+            await sendText({
+              to: m.from,
+              body: 'Ten numer nie jest przypisany do żadnego użytkownika. Prosimy o bezpośredni kontakt ze Studiem przez formularz kontaktowy na stronie ...'
+            });
+          } else if (sender.type === 'instructor') {
+            // brak akcji
+          } else if (sender.type === 'user' && !sender.active) {
+            await sendText({ to: m.from, body: 'Dziękujemy za wiadomość.' });
+          } else if (sender.type === 'user' && sender.active) {
+            await sendText({ to: m.from, body: `Cześć ${sender.name}!` });
           }
         }
       }
     }
-
-    await client.query('COMMIT');
-    return res.sendStatus(200);
-  } catch (e) {
-    await client.query('ROLLBACK');
-    console.error('Webhook insert error:', e);
-    return res.sendStatus(500);
+  } catch (err) {
+    console.error('[webhook] error', err);
   } finally {
     client.release();
   }
+  res.sendStatus(200);
 });
 
-/* =========================
-   START
-   ========================= */
-const PORT = process.env.PORT || 3000;
-
+// =========================
+// HEALTH / START
+// =========================
 app.get('/health', (req, res) => res.status(200).send('ok'));
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Webhook listening on :${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log(`Webhook listening on :${PORT}`));
