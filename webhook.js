@@ -85,16 +85,144 @@ async function resolveSenderType(client, wa) {
   return { type: 'none' };
 }
 
+async function processAbsence(client, userId, ymd) {
+  // format: ymd = '2025-11-06'
+  try {
+    await client.query('BEGIN');
+
+    // 1️⃣ Sprawdź, czy user ma rezerwację tego dnia
+    const enr = await client.query(
+      `SELECT id, class_template_id 
+         FROM public.enrollments 
+        WHERE user_id = $1 AND session_date = $2::date AND status = 'booked'
+        LIMIT 1`,
+      [userId, ymd]
+    );
+    if (enr.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { ok: false, reason: 'no_enrollment' };
+    }
+    const enrollmentId = enr.rows[0].id;
+    const classTemplateId = enr.rows[0].class_template_id;
+
+    // 2️⃣ Dodaj rekord do absences (unikalność: user_id + session_date)
+    await client.query(
+      `INSERT INTO public.absences (user_id, session_date, created_at)
+       VALUES ($1, $2::date, now())
+       ON CONFLICT (user_id, session_date) DO NOTHING`,
+      [userId, ymd]
+    );
+
+    // 3️⃣ Zwiększ saldo kredytów użytkownika o 1
+    await client.query(
+      `INSERT INTO public.user_absence_credits (user_id, balance)
+       VALUES ($1, 1)
+       ON CONFLICT (user_id)
+       DO UPDATE SET balance = user_absence_credits.balance + 1,
+                     updated_at = now()`,
+      [userId]
+    );
+
+    // 4️⃣ Zwolnij zajęte miejsce (status → 'cancelled')
+    await client.query(
+      `UPDATE public.enrollments
+          SET status = 'cancelled', updated_at = now()
+        WHERE id = $1`,
+      [enrollmentId]
+    );
+
+    // 5️⃣ Utwórz nowy slot w tabeli slots
+    await client.query(
+      `INSERT INTO public.slots (class_template_id, session_date, is_open, created_at)
+       VALUES ($1, $2::date, true, now())`,
+      [classTemplateId, ymd]
+    );
+
+    await client.query('COMMIT');
+    return { ok: true };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[processAbsence] error', err);
+    return { ok: false, reason: 'exception', error: err.message };
+  }
+}
 // =========================
-// WHATSAPP WEBHOOK
+// PARSER KOMEND (Zwalniam dd/mm)
 // =========================
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
-  return res.sendStatus(403);
-});
+function parseAbsenceCommand(text) {
+  const m = text.trim().match(/^zwalniam\s+(\d{1,2})[./-](\d{1,2})$/i);
+  if (!m) return null;
+
+  const day = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+
+  const now = new Date();
+  const currentMonth = now.getMonth() + 1;
+  let year = now.getFullYear();
+  if (month < currentMonth) year += 1; // grudzień → styczeń
+
+  const pad = n => String(n).padStart(2, '0');
+  const ymd = `${year}-${pad(month)}-${pad(day)}`;
+
+  return { ymd };
+}
+
+// =========================
+// LISTA ZAJĘĆ UŻYTKOWNIKA (14 dni)
+// =========================
+async function buildUpcomingClassesList(client, userId) {
+  const res = await client.query(`
+    SELECT e.id AS enrollment_id,
+           g.name AS group_name,
+           e.session_date,
+           ct.start_time
+      FROM public.enrollments e
+      JOIN public.class_templates ct ON ct.id = e.class_template_id
+      JOIN public.groups g ON g.id = ct.group_id
+     WHERE e.user_id = $1
+       AND e.status = 'booked'
+       AND e.session_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '14 days'
+     ORDER BY e.session_date, ct.start_time
+     LIMIT 10;
+  `, [userId]);
+
+  return res.rows.map(r => ({
+    id: `cancel_${r.enrollment_id}`,
+    title: `${r.group_name}`,
+    description: `${r.session_date.toISOString().slice(0,10)} ${r.start_time.slice(0,5)}`
+  }));
+}
+
+// =========================
+// WYSYŁKA INTERAKTYWNEJ LISTY
+// =========================
+async function sendAbsenceList(to, classes) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: String(to).replace(/^\+/, ''),
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: { text: 'Wybierz zajęcia, które chcesz odwołać:' },
+      footer: { text: 'Jeśli chcesz zgłosić inny termin, wybierz opcję poniżej.' },
+      action: {
+        button: 'Wybierz',
+        sections: [
+          {
+            title: 'Twoje zajęcia (14 dni)',
+            rows: classes
+          },
+          {
+            title: 'Inne opcje',
+            rows: [{ id: 'cancel_other', title: 'Inny termin', description: 'Podaj datę ręcznie' }]
+          }
+        ]
+      }
+    }
+  };
+  await postWA({ phoneId: WA_PHONE_ID, payload });
+}
+
 
 app.post('/webhook', async (req, res) => {
   //komunikat na log czy wiadomosc zostala otrzymana
@@ -139,7 +267,7 @@ app.post('/webhook', async (req, res) => {
 
           const sender = await resolveSenderType(client, m.from);
           console.log('[SENDER]', sender);
-
+            
           if (sender.type === 'none') {
             await sendText({
               to: m.from,
@@ -151,6 +279,36 @@ app.post('/webhook', async (req, res) => {
             await sendText({ to: m.from, body: 'Dziękujemy za wiadomość.' });
           } else if (sender.type === 'user' && sender.active) {
             await sendText({ to: m.from, body: `Cześć ${sender.name}!` });
+          }
+
+          // --- rozpoznanie komendy Zwalniam dd/mm ---
+          if (sender.type === 'user' && sender.active && m.text?.body) {
+            const parsed = parseAbsenceCommand(m.text.body);
+            if (parsed) {
+              const result = await processAbsence(client, sender.id, parsed.ymd);
+              if (result.ok) {
+                await sendText({
+                  to: m.from,
+                  body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`
+                });
+              } else if (result.reason === 'no_enrollment') {
+              const upcoming = await buildUpcomingClassesList(client, sender.id);
+
+                if (upcoming.length > 0) {
+                  await sendAbsenceList(m.from, upcoming);
+                } else {
+                  await sendText({
+                    to: m.from,
+                    body: '❗ Nie masz żadnych zajęć w najbliższych 14 dniach. Jeśli chcesz zgłosić inny termin, napisz np. "Zwalniam 05/12".'
+                  });
+                }
+              } else {
+                await sendText({
+                  to: m.from,
+                  body: `❗ Wystąpił błąd przy zgłaszaniu nieobecności (${result.reason || 'unknown'}).`
+                });
+              }
+            }
           }
         }
       }
