@@ -97,8 +97,14 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
+  //komunikat na log czy wiadomosc zostala otrzymana
   console.log('[WEBHOOK] incoming hit');
-  console.log('[WEBHOOK BODY]', JSON.stringify(req.body).slice(0, 500));
+  //komunikat na log czy wiadomoc zostala sparsowana
+  try {
+  console.log('[WEBHOOK BODY]', JSON.stringify(req.body || {}).slice(0, 500));
+  } catch (e) {
+  console.log('[WEBHOOK BODY PARSE ERROR]', e?.message);
+  }
   if (APP_SECRET) {
     const sig = req.get('x-hub-signature-256') || '';
     const [prefix, hex] = sig.split('=');
