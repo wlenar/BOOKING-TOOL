@@ -138,6 +138,7 @@ app.post('/webhook', async (req, res) => {
           await insertInboxRecord(client, rec);
 
           const sender = await resolveSenderType(client, m.from);
+          console.log('[SENDER]', sender);
 
           if (sender.type === 'none') {
             await sendText({
