@@ -39,10 +39,20 @@ const {
   APP_SECRET,
   WA_TOKEN,
   WA_PHONE_ID,          // provider_uid
+  WHATSAPP_TOKEN,
+  WHATSAPP_PHONE_NUMBER_ID,
   DATABASE_URL,
   LOG_LEVEL = 'info',
 } = process.env;
 
+
+// ---- Env resolve (keep original names) ----
+function getToken() {
+  return WA_TOKEN || WHATSAPP_TOKEN;
+}
+function getPhoneId() {
+  return WA_PHONE_ID || WHATSAPP_PHONE_NUMBER_ID;
+}
 // ---- Logger ----
 function log(level, msg, obj) {
   const levels = ['error', 'warn', 'info', 'debug'];
@@ -116,7 +126,7 @@ app.post('/webhook', async (req, res) => {
           for (const m of data.messages) {
             try {
               await insertInboundProvider({
-                provider_uid: data.metadata?.phone_number_id || WA_PHONE_ID || null,
+                provider_uid: data.metadata?.phone_number_id || getPhoneId() || null,
                 provider_message_id: m.id || null,
                 message_type: m.type || null,
                 from_wa_id: m.from || null,
@@ -136,7 +146,7 @@ app.post('/webhook', async (req, res) => {
             // Auto-ACK
             if (m.from) {
               try {
-                await sendText({ to: m.from, body: 'Dziękujemy za informację.' });
+                await sendText({ to: m.from, body: 'Dziękujemy za wiadomość.' });
               } catch (e) {
                 log('warn', '[OUTBOUND][ACK] failed', { error: e.message });
               }
@@ -149,7 +159,7 @@ app.post('/webhook', async (req, res) => {
           for (const s of data.statuses) {
             try {
               await insertStatusProvider({
-                provider_uid: data.metadata?.phone_number_id || WA_PHONE_ID || null,
+                provider_uid: data.metadata?.phone_number_id || getPhoneId() || null,
                 provider_message_id: s.id || null,
                 to_msisdn: normalizeMsisdn(s.recipient_id),
                 status: s.status || null,
@@ -235,8 +245,8 @@ async function insertStatusProvider({
 
 // ---- Outbound helper ----
 async function sendText({ to, body, phoneNumberId = null }) {
-  const phoneId = phoneNumberId || WA_PHONE_ID;
-  if (!WA_TOKEN || !phoneId) throw new Error('Missing WA_TOKEN or WA_PHONE_ID');
+  const phoneId = phoneNumberId || getPhoneId();
+  if (!getToken() || !phoneId) throw new Error('Missing token or phone id');
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
   const payload = {
     messaging_product: 'whatsapp',
@@ -247,7 +257,7 @@ async function sendText({ to, body, phoneNumberId = null }) {
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
+      Authorization: `Bearer ${getToken()}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
