@@ -85,67 +85,89 @@ async function resolveSenderType(client, wa) {
   return { type: 'none' };
 }
 
+// =========================
+// Czy user ma zajęcia tego dnia? (enrollments -> class_templates.weekday_iso)
+// =========================
+async function userHasClassThatDay(client, userId, ymd) {
+  // ymd: 'YYYY-MM-DD'
+  const q = await client.query(`
+    SELECT 1
+    FROM public.enrollments e
+    JOIN public.class_templates ct ON ct.id = e.class_template_id
+    WHERE e.user_id = $1
+      AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
+    LIMIT 1
+  `, [userId, ymd]);
+  return q.rowCount > 0;
+}
+
+// =========================
+// Główna operacja: zgłoszenie nieobecności + utworzenie wolnego slotu
+// =========================
 async function processAbsence(client, userId, ymd) {
-  // format: ymd = '2025-11-06'
   try {
     await client.query('BEGIN');
 
-    // 1️⃣ Sprawdź, czy user ma rezerwację tego dnia
-    const enr = await client.query(
-      `SELECT enrollment_id, class_template_id 
-         FROM public.enrollments 
-        WHERE user_id = $1 AND session_date = $2::date AND status = 'booked'
-        LIMIT 1`,
-      [userId, ymd]
-    );
-    if (enr.rowCount === 0) {
+    // 1) weryfikacja czy user ma zajęcia w ten dzień (po weekday_iso)
+    const has = await userHasClassThatDay(client, userId, ymd);
+    if (!has) {
       await client.query('ROLLBACK');
-      return { ok: false, reason: 'no_enrollment' };
+      return { ok: false, reason: 'no_enrollment_for_weekday' };
     }
-    const enrollmentId = enr.rows[0].enrollment_id;
-    const classTemplateId = enr.rows[0].class_template_id;
 
-    // 2️⃣ Dodaj rekord do absences (unikalność: user_id + session_date)
-    await client.query(
-      `INSERT INTO public.absences (user_id, session_date, created_at)
-       VALUES ($1, $2::date, now())
-       ON CONFLICT (user_id, session_date) DO NOTHING`,
-      [userId, ymd]
-    );
+    // 2) (opcjonalnie) ustalenie właściwego class_template_id pasującego do weekday
+    const ct = await client.query(`
+      SELECT ct.id AS class_template_id
+      FROM public.enrollments e
+      JOIN public.class_templates ct ON ct.id = e.class_template_id
+      WHERE e.user_id = $1
+        AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
+      ORDER BY ct.start_time
+      LIMIT 1
+    `, [userId, ymd]);
 
-    // 3️⃣ Zwiększ saldo kredytów użytkownika o 1
-    await client.query(
-      `INSERT INTO public.user_absence_credits (user_id, balance)
-       VALUES ($1, 1)
-       ON CONFLICT (user_id)
-       DO UPDATE SET balance = user_absence_credits.balance + 1,
-                     updated_at = now()`,
-      [userId]
-    );
+    if (ct.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { ok: false, reason: 'mapping_not_found' };
+    }
+    const classTemplateId = ct.rows[0].class_template_id;
 
-    // 4️⃣ Zwolnij zajęte miejsce (status → 'cancelled')
-    await client.query(
-      `UPDATE public.enrollments
-          SET status = 'cancelled', updated_at = now()
-        WHERE id = $1`,
-      [enrollmentId]
-    );
+    // 3) wpis do absences (wg schemy: user_id, session_date, created_at)
+    const insAbs = await client.query(`
+      INSERT INTO public.absences (user_id, session_date, created_at)
+      VALUES ($1, $2::date, now())
+      ON CONFLICT (user_id, session_date) DO NOTHING
+      RETURNING id
+    `, [userId, ymd]);
 
-    // 5️⃣ Utwórz nowy slot w tabeli slots
-    await client.query(
-      `INSERT INTO public.slots (class_template_id, session_date, is_open, created_at)
-       VALUES ($1, $2::date, true, now())`,
-      [classTemplateId, ymd]
-    );
+    // id absencji (jeśli ON CONFLICT – spróbujemy je pobrać)
+    let absenceId = insAbs.rows[0]?.id ?? null;
+    if (!absenceId) {
+      const getAbs = await client.query(`
+        SELECT id FROM public.absences
+        WHERE user_id = $1 AND session_date = $2::date
+        LIMIT 1
+      `, [userId, ymd]);
+      absenceId = getAbs.rows[0]?.id ?? null;
+    }
+
+    // 4) utworzenie wolnego slotu w slots
+    //    (bez przypisania usera; oznacz jako open; źródło = ta absencja — jeśli masz kolumnę referencyjną)
+    //    Uwaga: NIE zgaduję nazwy kolumny źródła. Jeśli masz np. slots.absence_id — dopisz w INSERT.
+    await client.query(`
+      INSERT INTO public.slots (class_template_id, session_date, is_open, created_at)
+      VALUES ($1, $2::date, true, now())
+    `, [classTemplateId, ymd]);
 
     await client.query('COMMIT');
-    return { ok: true };
+    return { ok: true, absence_id: absenceId, class_template_id: classTemplateId };
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[processAbsence] error', err);
     return { ok: false, reason: 'exception', error: err.message };
   }
 }
+
 // =========================
 // PARSER KOMEND (Zwalniam dd/mm)
 // =========================
@@ -291,7 +313,7 @@ app.post('/webhook', async (req, res) => {
                   to: m.from,
                   body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`
                 });
-              } else if (result.reason === 'no_enrollment') {
+              } else if (result.reason === 'no_enrollment_for_weekday') {
               const upcoming = await buildUpcomingClassesList(client, sender.id);
 
                 if (upcoming.length > 0) {
