@@ -5,11 +5,7 @@ const { Pool } = require('pg');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const app = express();
-app.use((req, res, next) => {
-  let data = [];
-  req.on('data', chunk => data.push(chunk));
-  req.on('end', () => { req.rawBody = Buffer.concat(data); next(); });
-});
+
 app.use(express.json({ verify: (req, res, buf) => { if (!req.rawBody) req.rawBody = Buffer.from(buf); } }));
 
 // =========================
