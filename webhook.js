@@ -163,12 +163,15 @@ async function insertInboundProvider({
 }) {
   if (!pool) return;
   const sql = `
-    insert into inbox_messages
-      (source, provider_uid, provider_message_id, message_direction, message_type,
+    insert into inbox_messages (source, provider_uid, provider_message_id, message_direction, message_type,
        from_wa_id, from_msisdn, to_msisdn, text_body, payload_json, received_at)
-    values
-      ('whatsapp', $1, $2, 'inbound', $3, $4, $5, $6, $7, $8, now())
-    on conflict on constraint ux_inbox_messages_source_provider_uid do nothing
+    select 'whatsapp', $1, $2, 'inbound', $3, $4, $5, $6, $7, $8, now()
+    where not exists (
+      select 1 from inbox_messages i
+      where i.source = 'whatsapp'
+        and i.provider_uid = $1
+        and i.provider_message_id = $2
+    )
   `;
   const params = [
     provider_uid,
@@ -195,12 +198,15 @@ async function insertStatusProvider({
 }) {
   if (!pool) return;
   const sql = `
-    insert into inbox_messages
-      (source, provider_uid, provider_message_id, message_direction, to_msisdn,
+    insert into inbox_messages (source, provider_uid, provider_message_id, message_direction, to_msisdn,
        status, error_code, error_title, sent_ts, payload_json, received_at)
-    values
-      ('whatsapp', $1, $2, 'outbound', $3, $4, $5, $6, $7, $8, now())
-    on conflict on constraint ux_inbox_messages_source_provider_uid do nothing
+    select 'whatsapp', $1, $2, 'outbound', $3, $4, $5, $6, $7, $8, now()
+    where not exists (
+      select 1 from inbox_messages i
+      where i.source = 'whatsapp'
+        and i.provider_uid = $1
+        and i.provider_message_id = $2
+    )
   `;
   const params = [
     provider_uid,
