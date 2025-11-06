@@ -98,6 +98,7 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   console.log('[WEBHOOK] incoming hit');
+  console.log('[WEBHOOK BODY]', JSON.stringify(req.body).slice(0, 500));
   if (APP_SECRET) {
     const sig = req.get('x-hub-signature-256') || '';
     const [prefix, hex] = sig.split('=');
