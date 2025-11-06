@@ -1,35 +1,13 @@
-// ==== WHATSAPP WEBHOOK — PROVIDER SCHEMA (FINAL) ====
-// Version: 2025-11-06
-// Tailored for table public.inbox_messages with columns (subset used):
-//   source text DEFAULT 'whatsapp' NOT NULL
-//   provider_uid text NOT NULL
-//   provider_message_id text
-//   message_direction text DEFAULT 'inbound' NOT NULL
-//   message_type text NOT NULL
-//   from_wa_id text
-//   from_msisdn text
-//   to_msisdn text
-//   text_body text
-//   status text
-//   error_code text
-//   error_title text
-//   sent_ts timestamptz
-//   received_at timestamptz DEFAULT now() NOT NULL
-//   payload_json jsonb NOT NULL
-//
-// Features:
-//  - GET /webhook (VERIFY_TOKEN)
-//  - POST /webhook with HMAC (APP_SECRET)
-//  - Insert inbound + status rows to provider-style schema
-//  - Auto-reply "Dziękujemy za informację." on inbound
-//  - No dynamic schema detection, no cron, no business logic
-
+// ==== WHATSAPP WEBHOOK — PROVIDER SCHEMA (FINAL v2) ====
+// Date: 2025-11-06
 'use strict';
 
 const express = require('express');
 const crypto = require('crypto');
-const fetch = require('node-fetch');
 const { Pool } = require('pg');
+
+// ---- Fetch (node18+: global fetch; else dynamic import) ----
+const fetch = globalThis.fetch || ((...args) => import('node-fetch').then(m => m.default(...args)));
 
 // ---- ENV ----
 const {
@@ -45,14 +23,10 @@ const {
   LOG_LEVEL = 'info',
 } = process.env;
 
+// prefer original names if present
+function getToken() { return WA_TOKEN || WHATSAPP_TOKEN; }
+function getPhoneId() { return WA_PHONE_ID || WHATSAPP_PHONE_NUMBER_ID; }
 
-// ---- Env resolve (keep original names) ----
-function getToken() {
-  return WA_TOKEN || WHATSAPP_TOKEN;
-}
-function getPhoneId() {
-  return WA_PHONE_ID || WHATSAPP_PHONE_NUMBER_ID;
-}
 // ---- Logger ----
 function log(level, msg, obj) {
   const levels = ['error', 'warn', 'info', 'debug'];
@@ -63,18 +37,14 @@ function log(level, msg, obj) {
 }
 
 // ---- DB ----
-const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-    })
-  : null;
+const pool = DATABASE_URL ? new Pool({
+  connectionString: DATABASE_URL,
+  ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+}) : null;
 
 // ---- App ----
 const app = express();
-app.use(express.json({
-  verify: (req, _res, buf) => { req.rawBody = buf; }
-}));
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // ---- HMAC verify ----
 function verifyMetaSignature(req) {
@@ -198,6 +168,7 @@ async function insertInboundProvider({
        from_wa_id, from_msisdn, to_msisdn, text_body, payload_json, received_at)
     values
       ('whatsapp', $1, $2, 'inbound', $3, $4, $5, $6, $7, $8, now())
+    on conflict on constraint ux_inbox_messages_source_provider_uid do nothing
   `;
   const params = [
     provider_uid,
@@ -229,6 +200,7 @@ async function insertStatusProvider({
        status, error_code, error_title, sent_ts, payload_json, received_at)
     values
       ('whatsapp', $1, $2, 'outbound', $3, $4, $5, $6, $7, $8, now())
+    on conflict on constraint ux_inbox_messages_source_provider_uid do nothing
   `;
   const params = [
     provider_uid,
@@ -246,7 +218,8 @@ async function insertStatusProvider({
 // ---- Outbound helper ----
 async function sendText({ to, body, phoneNumberId = null }) {
   const phoneId = phoneNumberId || getPhoneId();
-  if (!getToken() || !phoneId) throw new Error('Missing token or phone id');
+  const token = getToken();
+  if (!token || !phoneId) throw new Error('Missing token or phone id');
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
   const payload = {
     messaging_product: 'whatsapp',
@@ -257,7 +230,7 @@ async function sendText({ to, body, phoneNumberId = null }) {
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${getToken()}`,
+      Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
@@ -272,7 +245,6 @@ async function sendText({ to, body, phoneNumberId = null }) {
 function normalizeMsisdn(msisdn) {
   if (!msisdn) return null;
   if (msisdn.startsWith('+')) return msisdn;
-  // WhatsApp 'from' is usually without '+' but in E.164 digits; add '+' heuristically
   if (/^\d+$/.test(msisdn)) return '+' + msisdn;
   return msisdn;
 }
