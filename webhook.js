@@ -92,7 +92,7 @@ async function processAbsence(client, userId, ymd) {
 
     // 1️⃣ Sprawdź, czy user ma rezerwację tego dnia
     const enr = await client.query(
-      `SELECT id, class_template_id 
+      `SELECT enrollment_id, class_template_id 
          FROM public.enrollments 
         WHERE user_id = $1 AND session_date = $2::date AND status = 'booked'
         LIMIT 1`,
@@ -102,7 +102,7 @@ async function processAbsence(client, userId, ymd) {
       await client.query('ROLLBACK');
       return { ok: false, reason: 'no_enrollment' };
     }
-    const enrollmentId = enr.rows[0].id;
+    const enrollmentId = enr.rows[0].enrollment_id;
     const classTemplateId = enr.rows[0].class_template_id;
 
     // 2️⃣ Dodaj rekord do absences (unikalność: user_id + session_date)
