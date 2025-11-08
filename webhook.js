@@ -175,9 +175,9 @@ async function userHasClassThatDay(client, userId, ymd) {
 }
 
 // =========================
-// Lista zajęć usera w najbliższych 14 dniach
+// Lista zajęć usera w najbliższych 14 dniach (do menu)
 // =========================
-async function getUpcomingUserClassesText(client, userId) {
+async function getUpcomingUserClasses(client, userId) {
   const sql = `
     SELECT
       d::date              AS session_date,
@@ -201,30 +201,117 @@ async function getUpcomingUserClassesText(client, userId) {
     WHERE EXTRACT(ISODOW FROM d) = ct.weekday_iso
     ORDER BY session_date, ct.start_time, class_template_id;
   `;
-
   const res = await client.query(sql, [userId]);
-  if (res.rowCount === 0) {
-    return 'W najbliższych 14 dniach nie masz zaplanowanych zajęć.';
+  return res.rows;
+}
+
+// =========================
+// Wysyłka menu zajęć (lista z aktywnym wyborem + "Inny termin")
+// =========================
+async function sendUpcomingClassesMenu({ client, to, userId }) {
+  const toNorm = normalizeTo(to);
+
+  const rows = await getUpcomingUserClasses(client, userId);
+
+  if (!rows || rows.length === 0) {
+    return sendText({
+      to: toNorm,
+      body: 'W najbliższych 14 dniach nie masz zaplanowanych zajęć.',
+      userId
+    });
   }
 
-  const lines = [];
-  let lastDate = null;
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: 'MENU_14_DNI (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_list',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
 
-  for (const row of res.rows) {
-    const dateObj = row.session_date;
-    const iso = dateObj.toISOString().slice(0, 10); // YYYY-MM-DD
-    if (iso !== lastDate) {
-      lastDate = iso;
-      const [y, m, d] = iso.split('-');
-      lines.push(`${d}.${m}`);
-    }
-
-    const timeFrom = String(row.start_time).slice(0, 5);
+  const sectionRows = rows.map((row) => {
+    const iso = row.session_date.toISOString().slice(0, 10); // YYYY-MM-DD
+    const [y, m, d] = iso.split('-');
+    const dateLabel = `${d}.${m}`;
+    const time = String(row.start_time).slice(0, 5);
     const loc = row.location_name ? ` (${row.location_name})` : '';
-    lines.push(`- ${timeFrom} ${row.group_name}${loc}`);
+    const title = `${dateLabel} ${time} ${row.group_name}${loc}`;
+    const id = `absence_${iso}_${row.class_template_id}`;
+    return { id, title };
+  });
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      header: {
+        type: 'text',
+        text: 'Wybierz zajęcia'
+      },
+      body: {
+        text: 'Poniżej Twoje zajęcia w najbliższych 14 dniach. Wybierz termin, którego dotyczy zgłoszenie nieobecności lub wybierz "Inny termin".'
+      },
+      footer: {
+        text: 'Dla "Inny termin" wpisz np. "Zwalniam 12/11".'
+      },
+      action: {
+        button: 'Wybierz termin',
+        sections: [
+          {
+            title: 'Twoje zajęcia',
+            rows: sectionRows
+          },
+          {
+            title: 'Inne opcje',
+            rows: [
+              {
+                id: 'absence_other_date',
+                title: 'Inny termin',
+                description: 'Podam inny termin w wiadomości'
+              }
+            ]
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog =
+    'MENU_14_DNI: ' +
+    sectionRows.map(r => r.title).join(' | ') +
+    ' | Inny termin';
+
+  if (res.ok) {
+    const waMessageId = res.data?.messages?.[0]?.id || null;
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: bodyLog,
+      messageType: 'interactive_list',
+      status: 'sent',
+      waMessageId
+    });
+  } else {
+    const reason = res.status ? `http_${res.status}` : 'send_failed';
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: bodyLog,
+      messageType: 'interactive_list',
+      status: 'error',
+      reason
+    });
   }
 
-  return lines.join('\n');
+  return res;
 }
 
 // =========================
@@ -411,11 +498,10 @@ app.post('/webhook', async (req, res) => {
                   userId: sender.id
               });
               } else if (result.reason === 'no_enrollment_for_weekday') {
-                const upcoming = await getUpcomingUserClassesText(client, sender.id);
-                await sendText({
-                to: m.from,
-                body: 'Nie udało się znaleźć Twoich zajęć w tym dniu.\nPoniżej Twoje zajęcia w najbliższych 14 dniach:\n' + upcoming,
-                userId: sender.id
+                await sendUpcomingClassesMenu({
+                  client,
+                  to: m.from,
+                  userId: sender.id
               });
               } else {
                 await sendText({
