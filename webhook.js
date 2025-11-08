@@ -159,7 +159,7 @@ async function processAbsence(client, userId, ymd) {
       INSERT INTO public.slots (
         class_template_id,
         session_date,
-        source_absence,
+        source_absence_id,
         status,
         taken_by_user,
         taken_at,
