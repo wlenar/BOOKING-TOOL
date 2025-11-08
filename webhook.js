@@ -108,20 +108,21 @@ async function processAbsence(client, userId, ymd) {
   try {
     await client.query('BEGIN');
 
-    // 1) znajdź class_template_id dla tego usera i dnia tygodnia
+    // 1) znajdź class_template_id, do którego user jest przypisany w ten dzień tygodnia
     const ctRes = await client.query(
       `
       SELECT ct.id AS class_template_id
       FROM public.enrollments e
       JOIN public.class_templates ct ON ct.id = e.class_template_id
       WHERE e.user_id = $1
+        AND ct.is_active = true
         AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
       LIMIT 1
       `,
       [userId, ymd]
     );
 
-    // user nie ma zajęć w tym dniu
+    // jeśli brak przypisania → nie ma zajęć w ten dzień
     if (ctRes.rowCount === 0) {
       await client.query('ROLLBACK');
       return { ok: false, reason: 'no_enrollment_for_weekday' };
@@ -153,7 +154,7 @@ async function processAbsence(client, userId, ymd) {
 
     const absenceId = absRes.rows[0].id;
 
-    // 3) utwórz wolny slot powiązany z tą absencją
+    // 3) utworzenie wolnego slotu powiązanego z absencją
     await client.query(
       `
       INSERT INTO public.slots (
@@ -213,58 +214,12 @@ function parseAbsenceCommand(text) {
 // =========================
 // LISTA ZAJĘĆ UŻYTKOWNIKA (14 dni)
 // =========================
-async function buildUpcomingClassesList(client, userId) {
-  const res = await client.query(`
-    SELECT e.id AS enrollment_id,
-           g.name AS group_name,
-           e.session_date,
-           ct.start_time
-      FROM public.enrollments e
-      JOIN public.class_templates ct ON ct.id = e.class_template_id
-      JOIN public.groups g ON g.id = ct.group_id
-     WHERE e.user_id = $1
-       AND e.status = 'booked'
-       AND e.session_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '14 days'
-     ORDER BY e.session_date, ct.start_time
-     LIMIT 10;
-  `, [userId]);
 
-  return res.rows.map(r => ({
-    id: `cancel_${r.enrollment_id}`,
-    title: `${r.group_name}`,
-    description: `${r.session_date.toISOString().slice(0,10)} ${r.start_time.slice(0,5)}`
-  }));
-}
 
 // =========================
 // WYSYŁKA INTERAKTYWNEJ LISTY
 // =========================
-async function sendAbsenceList(to, classes) {
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: String(to).replace(/^\+/, ''),
-    type: 'interactive',
-    interactive: {
-      type: 'list',
-      body: { text: 'Wybierz zajęcia, które chcesz odwołać:' },
-      footer: { text: 'Jeśli chcesz zgłosić inny termin, wybierz opcję poniżej.' },
-      action: {
-        button: 'Wybierz',
-        sections: [
-          {
-            title: 'Twoje zajęcia (14 dni)',
-            rows: classes
-          },
-          {
-            title: 'Inne opcje',
-            rows: [{ id: 'cancel_other', title: 'Inny termin', description: 'Podaj datę ręcznie' }]
-          }
-        ]
-      }
-    }
-  };
-  await postWA({ phoneId: WA_PHONE_ID, payload });
-}
+
 
 
 app.post('/webhook', async (req, res) => {
@@ -336,8 +291,10 @@ app.post('/webhook', async (req, res) => {
                   body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`
                 });
               } else if (result.reason === 'no_enrollment_for_weekday') {
-              const upcoming = await buildUpcomingClassesList(client, sender.id);
-
+              await sendText({
+                to: m.from,
+                body: 'Nie udało się znaleźć Twoich zajęć w tym dniu.'
+              });
                 if (upcoming.length > 0) {
                   await sendAbsenceList(m.from, upcoming);
                 } else {
