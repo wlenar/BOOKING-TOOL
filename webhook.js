@@ -161,7 +161,7 @@ async function processAbsence(client, userId, ymd) {
         session_date,
         source_absence_id,
         status,
-        taken_by_user,
+        taken_by_user_id,
         taken_at,
         created_at,
         updated_at
