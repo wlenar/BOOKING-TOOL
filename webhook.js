@@ -175,6 +175,59 @@ async function userHasClassThatDay(client, userId, ymd) {
 }
 
 // =========================
+// Lista zajęć usera w najbliższych 14 dniach
+// =========================
+async function getUpcomingUserClassesText(client, userId) {
+  const sql = `
+    SELECT
+      d::date              AS session_date,
+      ct.id                AS class_template_id,
+      g.name               AS group_name,
+      ct.start_time,
+      COALESCE(l.name, '') AS location_name
+    FROM generate_series(current_date,
+                         current_date + interval '13 days',
+                         interval '1 day') AS d
+    JOIN public.enrollments e
+      ON e.user_id = $1
+    JOIN public.class_templates ct
+      ON ct.id = e.class_template_id
+     AND ct.is_active = true
+    JOIN public.groups g
+      ON g.id = ct.group_id
+     AND g.is_active = true
+    LEFT JOIN public.locations l
+      ON l.id = g.location_id
+    WHERE EXTRACT(ISODOW FROM d) = ct.weekday_iso
+    ORDER BY session_date, ct.start_time, class_template_id;
+  `;
+
+  const res = await client.query(sql, [userId]);
+  if (res.rowCount === 0) {
+    return 'W najbliższych 14 dniach nie masz zaplanowanych zajęć.';
+  }
+
+  const lines = [];
+  let lastDate = null;
+
+  for (const row of res.rows) {
+    const dateObj = row.session_date;
+    const iso = dateObj.toISOString().slice(0, 10); // YYYY-MM-DD
+    if (iso !== lastDate) {
+      lastDate = iso;
+      const [y, m, d] = iso.split('-');
+      lines.push(`${d}.${m}`);
+    }
+
+    const timeFrom = String(row.start_time).slice(0, 5);
+    const loc = row.location_name ? ` (${row.location_name})` : '';
+    lines.push(`- ${timeFrom} ${row.group_name}${loc}`);
+  }
+
+  return lines.join('\n');
+}
+
+// =========================
 // Główna operacja: zgłoszenie nieobecności + utworzenie wolnego slotu
 // =========================
 async function processAbsence(client, userId, ymd) {
@@ -285,11 +338,6 @@ function parseAbsenceCommand(text) {
 }
 
 // =========================
-// LISTA ZAJĘĆ UŻYTKOWNIKA (14 dni)
-// =========================
-
-
-// =========================
 // WYSYŁKA INTERAKTYWNEJ LISTY
 // =========================
 
@@ -363,10 +411,12 @@ app.post('/webhook', async (req, res) => {
                   userId: sender.id
               });
               } else if (result.reason === 'no_enrollment_for_weekday') {
+                const upcoming = await getUpcomingUserClassesText(client, sender.id);
                 await sendText({
-                  to: m.from,
-                  body: 'Nie udało się znaleźć Twoich zajęć w tym dniu. Prosimy o prostą wiadomość "Zwalniam dd/mm". Tymczasem poniżej lista Twoich zajęć w najbliższych 14 dniach.'
-                });
+                to: m.from,
+                body: 'Nie udało się znaleźć Twoich zajęć w tym dniu.\nPoniżej Twoje zajęcia w najbliższych 14 dniach:\n' + upcoming,
+                userId: sender.id
+              });
               } else {
                 await sendText({
                   to: m.from,
