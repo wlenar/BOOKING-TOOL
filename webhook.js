@@ -256,15 +256,8 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
     type: 'interactive',
     interactive: {
       type: 'list',
-      header: {
-        type: 'text',
-        text: 'Wybierz zajęcia, które chcesz zwolnić'
-      },
       body: {
         text: 'Wybierz termin zajęć, dla których chcesz zgłosić nieobecność, lub wybierz "Inny termin".'
-      },
-      footer: {
-        text: 'Dla "Inny termin" wpisz później wiadomość "Zwalniam dd/mm".'
       },
       action: {
         button: 'Wybierz termin',
