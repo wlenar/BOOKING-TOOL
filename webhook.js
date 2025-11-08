@@ -670,8 +670,18 @@ app.post('/webhook', async (req, res) => {
             }
           }
 
-          // 3) Aktywny user: komenda tekstowa "Zwalniam dd/mm" + ewentualne powitanie
+          // 3) Aktywny user: powitanie + obsługa "Zwalniam dd/mm"
           if (!handled && sender.type === 'user' && sender.active) {
+            handled = true;
+
+            // powitanie zawsze na start
+            await sendText({
+              to: m.from,
+              body: `Cześć ${sender.name}!`,
+              userId: sender.id
+            });
+
+            // jeśli jest komenda "Zwalniam dd/mm" → próbujemy zgłosić nieobecność
             if (m.text?.body) {
               const parsed = parseAbsenceCommand(m.text.body);
               if (parsed) {
@@ -685,6 +695,11 @@ app.post('/webhook', async (req, res) => {
                   });
                   await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
                 } else if (result.reason === 'no_enrollment_for_weekday') {
+                  await sendText({
+                    to: m.from,
+                    body: 'Nie znalazłem Twoich zajęć w tym terminie.',
+                    userId: sender.id
+                  });
                   await sendUpcomingClassesMenu({
                     client,
                     to: m.from,
@@ -697,50 +712,9 @@ app.post('/webhook', async (req, res) => {
                     userId: sender.id
                   });
                 }
-
-                handled = true;
-              }
-            }  
-          
-          // jeśli to nie była komenda: tylko powitanie
-            if (!handled) {
-              await sendText({
-                to: m.from,
-                body: `Cześć ${sender.name}!`,
-                userId: sender.id
-              });
-            }
-          }
-          // --- rozpoznanie komendy Zwalniam dd/mm ---
-          if (sender.type === 'user' && sender.active && m.text?.body) {
-            const parsed = parseAbsenceCommand(m.text.body);
-            if (parsed) {
-              const result = await processAbsence(client, sender.id, parsed.ymd);
-              if (result.ok) {
-                await sendText({
-                  to: m.from,
-                  body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`,
-                  userId: sender.id
-              });
-              } else if (result.reason === 'no_enrollment_for_weekday') {
-                await sendText({
-                  to: m.from,
-                  body: 'Nie znalazłem Twoich zajęć w tym terminie.',
-                  userId: sender.id
-                });
-                await sendUpcomingClassesMenu({
-                  client,
-                  to: m.from,
-                  userId: sender.id
-              });
-              } else {
-                await sendText({
-                  to: m.from,
-                  body: `❗ Wystąpił błąd przy zgłaszaniu nieobecności (${result.reason || 'unknown'}).`,
-                  userId: sender.id
-                });
               }
             }
+            // jeśli brak komendy → zostaje samo "Cześć <imię>!"
           }
         }
       }
