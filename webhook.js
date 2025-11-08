@@ -231,7 +231,7 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
   }
 
   const sectionRows = rows
-    .slice(0, 20)
+    .slice(0, 10) // WA: max 10 wierszy w sekcji
     .map((row) => {
       const rawDate = row.session_date;
       const iso = rawDate instanceof Date
@@ -240,9 +240,13 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
 
       const [y, m, d] = iso.split('-');
       const yy = y.slice(2, 4);
-      const title = `${d}/${m}/${yy} ${row.group_name}`;
-      const id = `absence_${iso}_${row.class_template_id}`;
 
+      let title = `${d}/${m}/${yy} ${row.group_name}`;
+      if (title.length > 24) {
+        title = title.slice(0, 24); // twardy limit WA
+      }
+
+      const id = `absence_${iso}_${row.class_template_id}`;
       return { id, title };
     });
 
@@ -344,11 +348,11 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
         buttons: [
           {
             type: 'reply',
-            reply: { id: 'absence_more_yes', title: 'Tak' }
+            reply: { id: 'absence_more_yes', title: '✅ Tak' }
           },
           {
             type: 'reply',
-            reply: { id: 'absence_more_no', title: 'Nie' }
+            reply: { id: 'absence_more_no', title: '❌ Nie' }
           }
         ]
       }
