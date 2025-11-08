@@ -108,61 +108,77 @@ async function processAbsence(client, userId, ymd) {
   try {
     await client.query('BEGIN');
 
-    // 1) weryfikacja czy user ma zajęcia w ten dzień (po weekday_iso)
-    const has = await userHasClassThatDay(client, userId, ymd);
-    console.log('[DEBUG hasClass]', has, 'ymd=', ymd); //diagnostyka do debugging USUNAC!!!
-    if (!has) {
-      await client.query('ROLLBACK');
-      return { ok: false, reason: 'no_enrollment_for_weekday' };
-    }
-
-    // 2) (opcjonalnie) ustalenie właściwego class_template_id pasującego do weekday
-    const ct = await client.query(`
+    // 1) znajdź class_template_id dla tego usera i dnia tygodnia
+    const ctRes = await client.query(
+      `
       SELECT ct.id AS class_template_id
       FROM public.enrollments e
       JOIN public.class_templates ct ON ct.id = e.class_template_id
       WHERE e.user_id = $1
         AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
-      ORDER BY ct.start_time
       LIMIT 1
-    `, [userId, ymd]);
+      `,
+      [userId, ymd]
+    );
 
-    console.log('[DEBUG ct]', { rowCount: ct.rowCount, rows: ct.rows }); //debugging bledu USUNAC!!!
-
-    if (ct.rowCount === 0) {
+    // user nie ma zajęć w tym dniu
+    if (ctRes.rowCount === 0) {
       await client.query('ROLLBACK');
-      return { ok: false, reason: 'mapping_not_found' };
-    }
-    const classTemplateId = ct.rows[0].class_template_id;
-
-    // 3) wpis do absences (wg schemy: user_id, session_date, created_at)
-    const insAbs = await client.query(`
-        INSERT INTO public.absences (user_id, class_template_id, session_date, created_at)
-        VALUES ($1, $2, $3::date, now())
-        ON CONFLICT (user_id, session_date)
-        DO UPDATE SET class_template_id = EXCLUDED.class_template_id,
-                updated_at       = now()
-        RETURNING id
-    `, [userId, classTemplateId, ymd]);
-
-    // id absencji (jeśli ON CONFLICT – spróbujemy je pobrać)
-    let absenceId = insAbs.rows[0]?.id ?? null;
-    if (!absenceId) {
-      const getAbs = await client.query(`
-        SELECT id FROM public.absences
-        WHERE user_id = $1 AND session_date = $2::date
-        LIMIT 1
-      `, [userId, ymd]);
-      absenceId = getAbs.rows[0]?.id ?? null;
+      return { ok: false, reason: 'no_enrollment_for_weekday' };
     }
 
-    // 4) utworzenie wolnego slotu w slots
-    //    (bez przypisania usera; oznacz jako open; źródło = ta absencja — jeśli masz kolumnę referencyjną)
-    //    Uwaga: NIE zgaduję nazwy kolumny źródła. Jeśli masz np. slots.absence_id — dopisz w INSERT.
-    await client.query(`
-      INSERT INTO public.slots (class_template_id, session_date, is_open, created_at)
-      VALUES ($1, $2::date, true, now())
-    `, [classTemplateId, ymd]);
+    const classTemplateId = ctRes.rows[0].class_template_id;
+
+    // 2) wpis do absences (audit, narastająco)
+    const absRes = await client.query(
+      `
+      INSERT INTO public.absences (
+        user_id,
+        class_template_id,
+        session_date,
+        reason,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3::date, 'whatsapp_bezposrednia_wiadomosc', now(), now())
+      ON CONFLICT (user_id, session_date)
+      DO UPDATE SET
+        class_template_id = EXCLUDED.class_template_id,
+        reason            = EXCLUDED.reason,
+        updated_at        = now()
+      RETURNING id
+      `,
+      [userId, classTemplateId, ymd]
+    );
+
+    const absenceId = absRes.rows[0].id;
+
+    // 3) utwórz wolny slot powiązany z tą absencją
+    await client.query(
+      `
+      INSERT INTO public.slots (
+        class_template_id,
+        session_date,
+        source_absence,
+        status,
+        taken_by_user,
+        taken_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2::date,
+        $3,
+        'open',
+        NULL,
+        NULL,
+        now(),
+        now()
+      )
+      `,
+      [classTemplateId, ymd, absenceId]
+    );
 
     await client.query('COMMIT');
     return { ok: true, absence_id: absenceId, class_template_id: classTemplateId };
