@@ -175,8 +175,9 @@ async function userHasClassThatDay(client, userId, ymd) {
 }
 
 // =========================
-// Lista zajęć usera w najbliższych 14 dniach (do menu)
+// LISTA ZAJĘĆ UŻYTKOWNIKA (14 dni) + MENU ABSENCJI
 // =========================
+
 async function getUpcomingUserClasses(client, userId) {
   const sql = `
     SELECT
@@ -205,12 +206,8 @@ async function getUpcomingUserClasses(client, userId) {
   return res.rows;
 }
 
-// =========================
-// Wysyłka menu zajęć (lista z aktywnym wyborem + "Inny termin")
-// =========================
 async function sendUpcomingClassesMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
-
   const rows = await getUpcomingUserClasses(client, userId);
 
   if (!rows || rows.length === 0) {
@@ -234,33 +231,19 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
   }
 
   const sectionRows = rows
-    .slice(0, 20) // limit bezpieczeństwa, WA max 20 wierszy
+    .slice(0, 20)
     .map((row) => {
       const rawDate = row.session_date;
       const iso = rawDate instanceof Date
         ? rawDate.toISOString().slice(0, 10)
-        : String(rawDate).slice(0, 10); // 'YYYY-MM-DD'
+        : String(rawDate).slice(0, 10); // YYYY-MM-DD
 
       const [y, m, d] = iso.split('-');
-      const dateLabel = `${d}.${m}`;
-      const time = String(row.start_time).slice(0, 5);
-      const loc = row.location_name ? ` (${row.location_name})` : '';
-      const base = `${dateLabel} ${time}`;
-      const main = `${row.group_name}${loc}`;
-
-      let title = `${base} ${main}`;
-      let description = '';
-
-      if (title.length > 24) {
-        title = title.slice(0, 24);
-        description = main; // pełna nazwa w opisie
-      }
-
+      const yy = y.slice(2, 4);
+      const title = `${d}/${m}/${yy} ${row.group_name}`;
       const id = `absence_${iso}_${row.class_template_id}`;
 
-      return description
-        ? { id, title, description }
-        : { id, title };
+      return { id, title };
     });
 
   const payload = {
@@ -271,13 +254,13 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
       type: 'list',
       header: {
         type: 'text',
-        text: 'Wybierz zajęcia'
+        text: 'Wybierz zajęcia, które chcesz zwolnić'
       },
       body: {
-        text: 'Poniżej Twoje zajęcia w najbliższych 14 dniach. Wybierz termin, którego dotyczy zgłoszenie nieobecności lub wybierz "Inny termin".'
+        text: 'Wybierz termin zajęć, dla których chcesz zgłosić nieobecność, lub wybierz "Inny termin".'
       },
       footer: {
-        text: 'Dla "Inny termin" wpisz np. "Zwalniam 12/11".'
+        text: 'Dla "Inny termin" wpisz później wiadomość "Zwalniam dd/mm".'
       },
       action: {
         button: 'Wybierz termin',
@@ -331,6 +314,173 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
   }
 
   return res;
+}
+
+async function sendAbsenceMoreQuestion({ to, userId }) {
+  const toNorm = normalizeTo(to);
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: 'ABSENCE_MORE (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_buttons',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: {
+        text: 'Czy chcesz zgłosić kolejną nieobecność?'
+      },
+      action: {
+        buttons: [
+          {
+            type: 'reply',
+            reply: { id: 'absence_more_yes', title: 'Tak' }
+          },
+          {
+            type: 'reply',
+            reply: { id: 'absence_more_no', title: 'Nie' }
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog = 'ABSENCE_MORE: [Tak] [Nie]';
+
+  if (res.ok) {
+    const waMessageId = res.data?.messages?.[0]?.id || null;
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: bodyLog,
+      messageType: 'interactive_buttons',
+      status: 'sent',
+      waMessageId
+    });
+  } else {
+    const reason = res.status ? `http_${res.status}` : 'send_failed';
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: bodyLog,
+      messageType: 'interactive_buttons',
+      status: 'error',
+      reason
+    });
+  }
+
+  return res;
+}
+
+async function handleAbsenceInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'user' || !sender.active) return false;
+
+  // wybór z listy zajęć
+  if (m.type === 'interactive' && m.interactive?.type === 'list_reply') {
+    const reply = m.interactive.list_reply;
+    const id = reply?.id || '';
+
+    if (!id.startsWith('absence_')) return false;
+
+    if (id === 'absence_other_date') {
+      await sendText({
+        to: m.from,
+        body: 'Napisz proszę wiadomość w formacie: "Zwalniam dd/mm" dla innego terminu.',
+        userId: sender.id
+      });
+      await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+      return true;
+    }
+
+    const parts = id.split('_'); // absence_YYYY-MM-DD_classTemplateId
+    if (parts.length < 3) return false;
+
+    const ymd = parts[1];
+
+    // czy już jest absencja na ten dzień?
+    const existing = await client.query(
+      `
+      SELECT id
+      FROM public.absences
+      WHERE user_id = $1
+        AND session_date = $2::date
+      LIMIT 1
+      `,
+      [sender.id, ymd]
+    );
+
+    if (existing.rowCount > 0) {
+      await sendText({
+        to: m.from,
+        body: `Na te zajęcia (${ymd}) jest już zgłoszona nieobecność.`,
+        userId: sender.id
+      });
+      await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+      return true;
+    }
+
+    const result = await processAbsence(client, sender.id, ymd);
+
+    if (result.ok) {
+      await sendText({
+        to: m.from,
+        body: `✔️ Nieobecność ${ymd} została zgłoszona, miejsce zwolnione.`,
+        userId: sender.id
+      });
+      await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+      return true;
+    }
+
+    if (result.reason === 'no_enrollment_for_weekday') {
+      await sendText({
+        to: m.from,
+        body: 'Nie udało się znaleźć Twoich zajęć w tym dniu. Sprawdź proszę termin lub wybierz inny z listy.',
+        userId: sender.id
+      });
+      await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+      return true;
+    }
+
+    await sendText({
+      to: m.from,
+      body: 'Coś poszło nie tak przy zgłaszaniu nieobecności. Spróbuj ponownie lub skontaktuj się ze studiem.',
+      userId: sender.id
+    });
+    return true;
+  }
+
+  // obsługa przycisków Tak/Nie
+  if (m.type === 'interactive' && m.interactive?.type === 'button_reply') {
+    const replyId = m.interactive.button_reply?.id || '';
+
+    if (replyId === 'absence_more_yes') {
+      await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
+      return true;
+    }
+
+    if (replyId === 'absence_more_no') {
+      await sendText({
+        to: m.from,
+        body: 'Dziękujemy, nieobecności zostały zapisane.',
+        userId: sender.id
+      });
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // =========================
@@ -491,20 +641,76 @@ app.post('/webhook', async (req, res) => {
           await insertInboxRecord(client, rec);
 
           const sender = await resolveSenderType(client, m.from);
-            
-          if (sender.type === 'none') {
-            await sendText({
-              to: m.from,
-              body: 'Ten numer nie jest przypisany do żadnego użytkownika. Prosimy o bezpośredni kontakt ze Studiem przez formularz kontaktowy na stronie https://agnieszkapilatesklasyczny.pl/'
-            });
-          } else if (sender.type === 'instructor') {
-            // brak akcji
-          } else if (sender.type === 'user' && !sender.active) {
-            await sendText({ to: m.from, body: 'Dziękujemy za wiadomość.', userId: sender.id });
-          } else if (sender.type === 'user' && sender.active) {
-            await sendText({ to: m.from, body: `Cześć ${sender.name}!`, userId: sender.id });
+
+          let handled = false;
+
+          // 1) Najpierw obsługa odpowiedzi interaktywnych (menu + Tak/Nie)
+          if (m.type === 'interactive') {
+            handled = await handleAbsenceInteractive({ client, m, sender });
           }
 
+          // 2) Obsługa typów nadawcy (jeśli nie przejęła tego logika absencji)
+          if (!handled) {
+            if (sender.type === 'none') {
+              await sendText({
+                to: m.from,
+                body: 'Ten numer nie jest przypisany do żadnego użytkownika. Jeśli chcesz dołączyć do zajęć, skontaktuj się ze studiem przez formularz kontaktowy na stronie https://agnieszkapilatesklasyczny.pl/'
+              });
+              handled = true;
+            } else if (sender.type === 'instructor') {
+              // brak akcji
+              handled = true;
+            } else if (sender.type === 'user' && !sender.active) {
+              await sendText({
+                to: m.from,
+                body: 'Dziękujemy za wiadomość.',
+                userId: sender.id
+              });
+              handled = true;
+            }
+          }
+
+          // 3) Aktywny user: komenda tekstowa "Zwalniam dd/mm" + ewentualne powitanie
+          if (!handled && sender.type === 'user' && sender.active) {
+            if (m.text?.body) {
+              const parsed = parseAbsenceCommand(m.text.body);
+              if (parsed) {
+                const result = await processAbsence(client, sender.id, parsed.ymd);
+
+                if (result.ok) {
+                  await sendText({
+                    to: m.from,
+                    body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`,
+                    userId: sender.id
+                  });
+                  await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+                } else if (result.reason === 'no_enrollment_for_weekday') {
+                  await sendUpcomingClassesMenu({
+                    client,
+                    to: m.from,
+                    userId: sender.id
+                  });
+                } else {
+                  await sendText({
+                    to: m.from,
+                    body: 'Coś poszło nie tak przy zgłaszaniu nieobecności. Spróbuj ponownie lub skontaktuj się ze studiem.',
+                    userId: sender.id
+                  });
+                }
+
+                handled = true;
+              }
+            }  
+          
+          // jeśli to nie była komenda: tylko powitanie
+            if (!handled) {
+              await sendText({
+                to: m.from,
+                body: `Cześć ${sender.name}!`,
+                userId: sender.id
+              });
+            }
+          }
           // --- rozpoznanie komendy Zwalniam dd/mm ---
           if (sender.type === 'user' && sender.active && m.text?.body) {
             const parsed = parseAbsenceCommand(m.text.body);
@@ -517,6 +723,11 @@ app.post('/webhook', async (req, res) => {
                   userId: sender.id
               });
               } else if (result.reason === 'no_enrollment_for_weekday') {
+                await sendText({
+                  to: m.from,
+                  body: 'Nie znalazłem Twoich zajęć w tym terminie.',
+                  userId: sender.id
+                });
                 await sendUpcomingClassesMenu({
                   client,
                   to: m.from,
