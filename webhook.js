@@ -234,15 +234,20 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
   }
 
   const sectionRows = rows.map((row) => {
-    const iso = row.session_date.toISOString().slice(0, 10); // YYYY-MM-DD
+    const rawDate = row.session_date;
+    const iso = rawDate instanceof Date
+      ? rawDate.toISOString().slice(0, 10)
+      : String(rawDate).slice(0, 10); // 'YYYY-MM-DD'
+
     const [y, m, d] = iso.split('-');
     const dateLabel = `${d}.${m}`;
     const time = String(row.start_time).slice(0, 5);
     const loc = row.location_name ? ` (${row.location_name})` : '';
     const title = `${dateLabel} ${time} ${row.group_name}${loc}`;
     const id = `absence_${iso}_${row.class_template_id}`;
+
     return { id, title };
-  });
+  })
 
   const payload = {
     messaging_product: 'whatsapp',
