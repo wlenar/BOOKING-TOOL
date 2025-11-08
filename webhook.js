@@ -110,6 +110,7 @@ async function processAbsence(client, userId, ymd) {
 
     // 1) weryfikacja czy user ma zajęcia w ten dzień (po weekday_iso)
     const has = await userHasClassThatDay(client, userId, ymd);
+    console.log('[DEBUG hasClass]', has, 'ymd=', ymd); //diagnostyka do debugging USUNAC!!!
     if (!has) {
       await client.query('ROLLBACK');
       return { ok: false, reason: 'no_enrollment_for_weekday' };
@@ -126,6 +127,8 @@ async function processAbsence(client, userId, ymd) {
       LIMIT 1
     `, [userId, ymd]);
 
+    console.log('[DEBUG ct]', { rowCount: ct.rowCount, rows: ct.rows }); //debugging bledu USUNAC!!!
+
     if (ct.rowCount === 0) {
       await client.query('ROLLBACK');
       return { ok: false, reason: 'mapping_not_found' };
@@ -134,11 +137,13 @@ async function processAbsence(client, userId, ymd) {
 
     // 3) wpis do absences (wg schemy: user_id, session_date, created_at)
     const insAbs = await client.query(`
-      INSERT INTO public.absences (user_id, session_date, created_at)
-      VALUES ($1, $2::date, now())
-      ON CONFLICT (user_id, session_date) DO NOTHING
-      RETURNING id
-    `, [userId, ymd]);
+        INSERT INTO public.absences (user_id, class_template_id, session_date, created_at)
+        VALUES ($1, $2, $3::date, now())
+        ON CONFLICT (user_id, session_date)
+        DO UPDATE SET class_template_id = EXCLUDED.class_template_id,
+                updated_at       = now()
+        RETURNING id
+    `, [userId, classTemplateId, ymd]);
 
     // id absencji (jeśli ON CONFLICT – spróbujemy je pobrać)
     let absenceId = insAbs.rows[0]?.id ?? null;
