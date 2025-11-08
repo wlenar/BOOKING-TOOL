@@ -39,14 +39,61 @@ async function postWA({ phoneId, payload }) {
   const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
   return { ok: resp.ok, status: resp.status, data: await resp.json().catch(() => ({})) };
 }
-async function sendText({ to, body }) {
-  const payload = { messaging_product: 'whatsapp', to: normalizeTo(to), type: 'text', text: { body } };
-  await postWA({ phoneId: WA_PHONE_ID, payload });
+
+async function sendText({ to, body, userId = null }) {
+  const toNorm = normalizeTo(to);
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body,
+      messageType: 'text',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'text',
+    text: { body }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  if (res.ok) {
+    const waMessageId = res.data?.messages?.[0]?.id || null;
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body,
+      messageType: 'text',
+      status: 'sent',
+      waMessageId
+    });
+  } else {
+    const reason = res.status ? `http_${res.status}` : 'send_failed';
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body,
+      messageType: 'text',
+      status: 'error',
+      reason
+    });
+  }
+
+  return res;
 }
 
 // =========================
 // DB HELPERS
 // =========================
+
+//funkcja do logowania przychodzących wiadomości w pliku Inbox
 async function insertInboxRecord(client, rec) {
   const sql = `INSERT INTO inbox_messages
     (source, provider_uid, message_direction, message_type, from_wa_id, text_body, sent_ts, payload_json)
@@ -56,6 +103,32 @@ async function insertInboxRecord(client, rec) {
     rec.source, rec.provider_uid, rec.message_direction, rec.message_type,
     rec.from_wa_id, rec.text_body, rec.sent_ts, rec.payload_json
   ]);
+}
+
+// funkcja do logowania wychodzących wiadomości w tablicy outbound
+async function auditOutbound({ userId, to, body, messageType, status, reason = null, waMessageId = null }) {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `
+      INSERT INTO public.outbound_messages (
+        user_id,
+        to_phone,
+        message_type,
+        body,
+        template_name,
+        variables,
+        status,
+        reason,
+        wa_message_id
+      )
+      VALUES ($1, $2, $3, $4, NULL, NULL, $5, $6, $7)
+      `,
+      [userId, to, messageType, body, status, reason, waMessageId]
+    );
+  } finally {
+    client.release();
+  }
 }
 
 // --- helper: identyfikacja nadawcy ---
@@ -223,13 +296,13 @@ function parseAbsenceCommand(text) {
 
 
 app.post('/webhook', async (req, res) => {
-  //komunikat na log czy wiadomosc zostala otrzymana
-  console.log('[WEBHOOK] incoming hit');
-  //komunikat na log czy wiadomoc zostala sparsowana
-  try {
-  console.log('[WEBHOOK BODY]', JSON.stringify(req.body || {}).slice(0, 500));
-  } catch (e) {
-  console.log('[WEBHOOK BODY PARSE ERROR]', e?.message);
+  if (DEBUG) {
+    console.log('[WEBHOOK] incoming hit');
+    try {
+      console.log('[WEBHOOK BODY]', JSON.stringify(req.body || {}).slice(0, 500));
+    } catch (e) {
+      console.log('[WEBHOOK BODY PARSE ERROR]', e?.message);
+    }
   }
   if (APP_SECRET) {
     const sig = req.get('x-hub-signature-256') || '';
@@ -264,49 +337,41 @@ app.post('/webhook', async (req, res) => {
           await insertInboxRecord(client, rec);
 
           const sender = await resolveSenderType(client, m.from);
-          console.log('[SENDER]', sender);
             
           if (sender.type === 'none') {
             await sendText({
               to: m.from,
-              body: 'Ten numer nie jest przypisany do żadnego użytkownika. Prosimy o bezpośredni kontakt ze Studiem przez formularz kontaktowy na stronie ...'
+              body: 'Ten numer nie jest przypisany do żadnego użytkownika. Prosimy o bezpośredni kontakt ze Studiem przez formularz kontaktowy na stronie https://agnieszkapilatesklasyczny.pl/'
             });
           } else if (sender.type === 'instructor') {
             // brak akcji
           } else if (sender.type === 'user' && !sender.active) {
-            await sendText({ to: m.from, body: 'Dziękujemy za wiadomość.' });
+            await sendText({ to: m.from, body: 'Dziękujemy za wiadomość.', userId: sender.id });
           } else if (sender.type === 'user' && sender.active) {
-            await sendText({ to: m.from, body: `Cześć ${sender.name}!` });
+            await sendText({ to: m.from, body: `Cześć ${sender.name}!`, userId: sender.id });
           }
 
           // --- rozpoznanie komendy Zwalniam dd/mm ---
           if (sender.type === 'user' && sender.active && m.text?.body) {
             const parsed = parseAbsenceCommand(m.text.body);
-            console.log('[DEBUG parser]', parsed); // do debuggowania - USUNAC
             if (parsed) {
               const result = await processAbsence(client, sender.id, parsed.ymd);
               if (result.ok) {
                 await sendText({
                   to: m.from,
-                  body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`
-                });
-              } else if (result.reason === 'no_enrollment_for_weekday') {
-              await sendText({
-                to: m.from,
-                body: 'Nie udało się znaleźć Twoich zajęć w tym dniu.'
+                  body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`,
+                  userId: sender.id
               });
-                if (upcoming.length > 0) {
-                  await sendAbsenceList(m.from, upcoming);
-                } else {
-                  await sendText({
-                    to: m.from,
-                    body: '❗ Nie masz żadnych zajęć w najbliższych 14 dniach. Jeśli chcesz zgłosić inny termin, napisz np. "Zwalniam 05/12".'
-                  });
-                }
+              } else if (result.reason === 'no_enrollment_for_weekday') {
+                await sendText({
+                  to: m.from,
+                  body: 'Nie udało się znaleźć Twoich zajęć w tym dniu. Prosimy o prostą wiadomość "Zwalniam dd/mm". Tymczasem poniżej lista Twoich zajęć w najbliższych 14 dniach.'
+                });
               } else {
                 await sendText({
                   to: m.from,
-                  body: `❗ Wystąpił błąd przy zgłaszaniu nieobecności (${result.reason || 'unknown'}).`
+                  body: `❗ Wystąpił błąd przy zgłaszaniu nieobecności (${result.reason || 'unknown'}).`,
+                  userId: sender.id
                 });
               }
             }
