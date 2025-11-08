@@ -233,21 +233,35 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
     return { ok: false, reason: 'missing_config' };
   }
 
-  const sectionRows = rows.map((row) => {
-    const rawDate = row.session_date;
-    const iso = rawDate instanceof Date
-      ? rawDate.toISOString().slice(0, 10)
-      : String(rawDate).slice(0, 10); // 'YYYY-MM-DD'
+  const sectionRows = rows
+    .slice(0, 20) // limit bezpieczeństwa, WA max 20 wierszy
+    .map((row) => {
+      const rawDate = row.session_date;
+      const iso = rawDate instanceof Date
+        ? rawDate.toISOString().slice(0, 10)
+        : String(rawDate).slice(0, 10); // 'YYYY-MM-DD'
 
-    const [y, m, d] = iso.split('-');
-    const dateLabel = `${d}.${m}`;
-    const time = String(row.start_time).slice(0, 5);
-    const loc = row.location_name ? ` (${row.location_name})` : '';
-    const title = `${dateLabel} ${time} ${row.group_name}${loc}`;
-    const id = `absence_${iso}_${row.class_template_id}`;
+      const [y, m, d] = iso.split('-');
+      const dateLabel = `${d}.${m}`;
+      const time = String(row.start_time).slice(0, 5);
+      const loc = row.location_name ? ` (${row.location_name})` : '';
+      const base = `${dateLabel} ${time}`;
+      const main = `${row.group_name}${loc}`;
 
-    return { id, title };
-  })
+      let title = `${base} ${main}`;
+      let description = '';
+
+      if (title.length > 24) {
+        title = title.slice(0, 24);
+        description = main; // pełna nazwa w opisie
+      }
+
+      const id = `absence_${iso}_${row.class_template_id}`;
+
+      return description
+        ? { id, title, description }
+        : { id, title };
+    });
 
   const payload = {
     messaging_product: 'whatsapp',
