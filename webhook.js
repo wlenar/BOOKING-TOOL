@@ -327,6 +327,7 @@ app.post('/webhook', async (req, res) => {
           // --- rozpoznanie komendy Zwalniam dd/mm ---
           if (sender.type === 'user' && sender.active && m.text?.body) {
             const parsed = parseAbsenceCommand(m.text.body);
+            console.log('[DEBUG parser]', parsed); // do debuggowania - USUNAC
             if (parsed) {
               const result = await processAbsence(client, sender.id, parsed.ymd);
               if (result.ok) {
