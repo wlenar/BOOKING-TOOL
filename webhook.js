@@ -686,48 +686,127 @@ async function handleAbsenceInteractive({ client, m, sender }) {
 
 async function handleMainMenuInteractive({ client, m, sender }) {
   if (!sender || sender.type !== 'user' || !sender.active) return false;
-  if (m.type !== 'interactive' || m.interactive?.type !== 'list_reply') {
+  if (m.type !== 'interactive') return false;
+
+  const itype = m.interactive?.type;
+
+  // -------------------------
+  // 1) Lista (MENU GŁÓWNE)
+  // -------------------------
+  if (itype === 'list_reply') {
+    const id = m.interactive.list_reply?.id || '';
+
+    if (id === 'menu_absence') {
+      await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
+      return true;
+    }
+
+    if (id === 'menu_makeup') {
+      // placeholder – do spięcia z logiką odrabiania
+      await sendText({
+        to: m.from,
+        body: 'Odrabianie zajęć: napisz proszę termin, który Cię interesuje, a studio skontaktuje się z Tobą w sprawie dostępnych miejsc.',
+        userId: sender.id
+      });
+      return true;
+    }
+
+    if (id === 'menu_credits') {
+      const { rows } = await client.query(
+        'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
+        [sender.id]
+      );
+      const bal = rows[0]?.balance || 0;
+
+      await sendText({
+        to: m.from,
+        body: `Masz ${bal} nieobecności do odrobienia.`,
+        userId: sender.id
+      });
+
+      // follow-up: zapytanie, czy wrócić do menu czy zakończyć
+      if (WA_TOKEN && WA_PHONE_ID) {
+        const toNorm = normalizeTo(m.from);
+        const payload = {
+          messaging_product: 'whatsapp',
+          to: toNorm,
+          type: 'interactive',
+          interactive: {
+            type: 'button',
+            body: {
+              text: 'Czy chcesz wrócić do menu głównego czy zakończyć rozmowę?'
+            },
+            action: {
+              buttons: [
+                {
+                  type: 'reply',
+                  reply: { id: 'credits_menu', title: '⬅️ Menu główne' }
+                },
+                {
+                  type: 'reply',
+                  reply: { id: 'credits_end', title: 'Zakończ rozmowę' }
+                }
+              ]
+            }
+          }
+        };
+
+        const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+        const bodyLog = 'CREDITS_FOLLOWUP: [Menu główne] [Zakończ rozmowę]';
+
+        const waMessageId = res.data?.messages?.[0]?.id || null;
+        const status = res.ok ? 'sent' : 'error';
+        const reason = res.ok
+          ? null
+          : (res.status ? `http_${res.status}` : 'send_failed');
+
+        await auditOutbound({
+          userId: sender.id,
+          to: toNorm,
+          body: bodyLog,
+          messageType: 'interactive_buttons',
+          status,
+          reason,
+          waMessageId
+        });
+      }
+
+      return true;
+    }
+
+    if (id === 'menu_end') {
+      await sendText({
+        to: m.from,
+        body: 'Dziękujemy za kontakt. Do zobaczenia na zajęciach!',
+        userId: sender.id
+      });
+      return true;
+    }
+
     return false;
   }
 
-  const id = m.interactive.list_reply?.id || '';
+  // -------------------------
+  // 2) Przyciski po "Ilość nieobecności"
+  // -------------------------
+  if (itype === 'button_reply') {
+    const replyId = m.interactive.button_reply?.id || '';
 
-  if (id === 'menu_absence') {
-    await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
-    return true;
-  }
+    if (replyId === 'credits_menu') {
+      await sendMainMenu({ to: m.from, userId: sender.id });
+      return true;
+    }
 
-  if (id === 'menu_makeup') {
-    // placeholder – do spięcia z logiką odrabiania
-    await sendText({
-      to: m.from,
-      body: 'Odrabianie zajęć: napisz proszę termin, który Cię interesuje, a studio skontaktuje się z Tobą w sprawie dostępnych miejsc.',
-      userId: sender.id
-    });
-    return true;
-  }
+    if (replyId === 'credits_end') {
+      await sendText({
+        to: m.from,
+        body: 'Dziękujemy za kontakt. Do zobaczenia na zajęciach!',
+        userId: sender.id
+      });
+      return true;
+    }
 
-  if (id === 'menu_credits') {
-    const { rows } = await client.query(
-      'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
-      [sender.id]
-    );
-    const bal = rows[0]?.balance || 0;
-    await sendText({
-      to: m.from,
-      body: `Masz ${bal} nieobecności do odrobienia.`,
-      userId: sender.id
-    });
-    return true;
-  }
-
-  if (id === 'menu_end') {
-    await sendText({
-      to: m.from,
-      body: 'Dziękujemy za kontakt. Do zobaczenia na zajęciach!',
-      userId: sender.id
-    });
-    return true;
+    return false;
   }
 
   return false;
@@ -1034,6 +1113,7 @@ app.post('/webhook', async (req, res) => {
                       body: `Masz ${bal} nieobecności do odrobienia.`,
                       userId: sender.id
                     });
+
                     localHandled = true;
                   } else if (choice === 'end') {
                     await sendText({
