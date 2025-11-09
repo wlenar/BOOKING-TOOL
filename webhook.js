@@ -1011,6 +1011,7 @@ app.post('/webhook', async (req, res) => {
 
               if (m.text?.body) {
                 const choice = parseMainMenuChoice(m.text.body);
+                
                 if (choice === 'absence') {
                   await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
                   localHandled = true;
@@ -1021,6 +1022,7 @@ app.post('/webhook', async (req, res) => {
                     userId: sender.id
                   });
                   localHandled = true;
+
                 } else if (choice === 'credits') {
                   const { rows } = await client.query(
                     'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
@@ -1041,7 +1043,7 @@ app.post('/webhook', async (req, res) => {
                     });
                     localHandled = true;
                   }
-
+                  // jeśli to nie był wybór z menu, sprawdzamy "zwalniam dd/mm"
                   if (!localHandled) {
                     const parsed = parseAbsenceCommand(m.text.body);
                     if (parsed) {
@@ -1054,12 +1056,14 @@ app.post('/webhook', async (req, res) => {
                           userId: sender.id
                         });
                         await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+                        localHandled = true;
                       } else if (result.reason === 'past_date') {
                         await sendText({
                           to: m.from,
                           body: 'Nie możesz zwolnić zajęć z datą w przeszłości.',
                           userId: sender.id
                         });
+                        localHandled = true;
                       } else if (result.reason === 'already_absent') {
                         await sendText({
                           to: m.from,
@@ -1067,6 +1071,7 @@ app.post('/webhook', async (req, res) => {
                           userId: sender.id
                         });
                         await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+                        localHandled = true;
                       } else if (result.reason === 'no_enrollment_for_weekday') {
                         await sendText({
                           to: m.from,
@@ -1078,6 +1083,7 @@ app.post('/webhook', async (req, res) => {
                           to: m.from,
                           userId: sender.id
                         });
+                        localHandled = true;
                       } else {
                         await sendText({
                           to: m.from,
@@ -1088,6 +1094,7 @@ app.post('/webhook', async (req, res) => {
                       }
                     }
                   }
+                  // jeśli dalej nic nie pasuje --> dopiero wtedy powitanie i menu
                   if (!localHandled) {
                     await sendText({
                       to: m.from,
