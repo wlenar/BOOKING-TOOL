@@ -950,6 +950,22 @@ if (WA_TOKEN && WA_PHONE_ID) {
   console.log('[CRON] Skipping CRON scheduling (missing WA config)');
 }
 
+// Ręczny trigger absence_reminder (tylko do testów!)
+app.get('/cron/manual-absence-reminder', async (req, res) => {
+  const token = req.query.token || '';
+  if (token !== process.env.CRON_TEST_TOKEN) {
+    return res.status(403).send('forbidden');
+  }
+
+  try {
+    await sendAbsenceReminderTemplate();
+    return res.status(200).send('absence_reminder triggered');
+  } catch (err) {
+    console.error('[MANUAL] absence_reminder error', err);
+    return res.status(500).send('error');
+  }
+});
+
 // =========================
 // HEALTH / START
 // =========================
