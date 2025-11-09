@@ -447,8 +447,15 @@ async function sendAbsenceReminderTemplate() {
         type: 'template',
         template: {
           name: 'absence_reminder',
-          language: { code: 'pl' }
-          // jeśli template wymaga parametrów, tu dodamy components
+          language: { code: 'pl' },
+          components: [
+            {
+              type: 'body',
+              parameters: [
+                { type: 'text', text: row.first_name || '' }
+              ]
+            }
+          ]
         }
       };
 
@@ -468,7 +475,7 @@ async function sendAbsenceReminderTemplate() {
         reason,
         waMessageId,
         templateName: 'absence_reminder',
-        variables: null
+        variables: JSON.stringify([row.first_name])
       });
     }
 
