@@ -402,6 +402,130 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
   return res;
 }
 
+async function sendMakeupMenu({ client, to, userId }) {
+  const toNorm = normalizeTo(to);
+
+  // odśwież oferty wg logiki z bazy
+  try {
+    await client.query('SELECT public.job_prepare_weekly_slot_offers();');
+  } catch (err) {
+    console.error('[makeup] job_prepare_weekly_slot_offers error', err);
+  }
+
+  // pobierz dostępne oferty dla tego usera
+  const q = await client.query(
+    `
+    SELECT
+      so.id              AS offer_id,
+      os.slot_id,
+      os.session_date,
+      os.session_time,
+      os.group_name
+    FROM public.slot_offers so
+    JOIN public.v_open_slots_desc os
+      ON os.slot_id = so.slot_id
+    WHERE
+          so.user_id = $1
+      AND so.status IN ('pending', 'sent')
+      AND os.session_date >= current_date
+      AND os.session_date <  current_date + interval '7 days'
+      AND os.free_capacity_remaining > 0
+    ORDER BY os.session_date, os.session_time, os.group_name
+    LIMIT 10
+    `,
+    [userId]
+  );
+
+  const rows = q.rows || [];
+
+  if (rows.length === 0) {
+    return sendText({
+      to: toNorm,
+      body: 'Aktualnie nie ma dostępnych wolnych miejsc do odrabiania w najbliższym tygodniu.',
+      userId
+    });
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: 'MAKEUP_MENU (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_list',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const listRows = rows.map((r) => {
+    const d = r.session_date;
+    const iso = d instanceof Date
+      ? d.toISOString().slice(0, 10)
+      : String(d).slice(0, 10); // YYYY-MM-DD
+
+    const [y, m, dd] = iso.split('-');
+    const label = `${dd}/${m} ${r.session_time?.slice(0, 5) || ''} ${r.group_name}`.trim();
+
+    let title = label;
+    let description = undefined;
+    if (title.length > 24) {
+      description = title.slice(24, 80);
+      title = title.slice(0, 24);
+    }
+
+    return {
+      id: `makeup_${r.offer_id}`, // spójne z broadcastem
+      title,
+      ...(description ? { description } : {})
+    };
+  });
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: {
+        text: 'Wybierz termin z dostępnych wolnych miejsc do odrabiania.'
+      },
+      action: {
+        button: 'Wybierz termin',
+        sections: [
+          {
+            title: 'Dostępne miejsca',
+            rows: listRows
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog =
+    'MAKEUP_MENU: ' + listRows.map(r => r.title).join(' | ');
+
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok
+    ? null
+    : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_list',
+    status,
+    reason,
+    waMessageId
+  });
+
+  return res;
+}
+
 async function sendMainMenu({ to, userId }) {
   const toNorm = normalizeTo(to);
 
@@ -525,6 +649,7 @@ async function runWeeklySlotsBroadcast() {
       FROM public.slot_offers so
       JOIN public.users u
         ON u.id = so.user_id
+        AND u.is_active = true
       JOIN public.v_open_slots_desc os
         ON os.slot_id = so.slot_id
       WHERE
@@ -899,12 +1024,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     }
 
     if (id === 'menu_makeup') {
-      // placeholder – do spięcia z logiką odrabiania
-      await sendText({
-        to: m.from,
-        body: 'Odrabianie zajęć: napisz proszę termin, który Cię interesuje, a studio skontaktuje się z Tobą w sprawie dostępnych miejsc.',
-        userId: sender.id
-      });
+      await sendMakeupMenu({ client, to: m.from, userId: sender.id });
       return true;
     }
 
