@@ -430,7 +430,7 @@ async function handleAbsenceInteractive({ client, m, sender }) {
       return true;
     }
 
-    const result = await processAbsence(client, sender.id, ymd);
+    const result = await processAbsence(client, sender.id, ymd, classTemplateId);
 
     if (result.ok) {
       await sendText({
@@ -500,6 +500,27 @@ async function handleAbsenceInteractive({ client, m, sender }) {
   }
 
   return false;
+}
+
+function parseAbsenceCommand(text) {
+  if (!text) return null;
+
+  const normalized = text.trim().toLowerCase();
+  const m = normalized.match(/^zwalniam\s+(\d{1,2})[./-](\d{1,2})$/);
+  if (!m) return null;
+
+  const day = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
+
+  const now = new Date();
+  const year = now.getFullYear();
+
+  const dd = String(day).padStart(2, '0');
+  const mm = String(month).padStart(2, '0');
+
+  const ymd = `${year}-${mm}-${dd}`;
+  return { ymd };
 }
 
 // =========================
