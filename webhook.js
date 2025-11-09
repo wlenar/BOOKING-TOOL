@@ -3,6 +3,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+const cron = require('node-cron');
 
 const app = express();
 
@@ -106,7 +107,17 @@ async function insertInboxRecord(client, rec) {
 }
 
 // funkcja do logowania wychodzących wiadomości w tablicy outbound
-async function auditOutbound({ userId, to, body, messageType, status, reason = null, waMessageId = null }) {
+async function auditOutbound({
+  userId,
+  to,
+  body,
+  messageType,
+  status,
+  reason = null,
+  waMessageId = null,
+  templateName = null,
+  variables = null
+}) {
   const client = await pool.connect();
   try {
     await client.query(
@@ -122,9 +133,19 @@ async function auditOutbound({ userId, to, body, messageType, status, reason = n
         reason,
         wa_message_id
       )
-      VALUES ($1, $2, $3, $4, NULL, NULL, $5, $6, $7)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       `,
-      [userId, to, messageType, body, status, reason, waMessageId]
+      [
+        userId,
+        to,
+        messageType,
+        body,
+        templateName,
+        variables,
+        status,
+        reason,
+        waMessageId
+      ]
     );
   } finally {
     client.release();
@@ -379,6 +400,84 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
   }
 
   return res;
+}
+
+async function runWeeklySlotsJob() {
+  const client = await pool.connect();
+  try {
+    console.log('[CRON] job_weekly_slots start');
+    await client.query('SELECT public.job_weekly_slots();');
+    console.log('[CRON] job_weekly_slots done');
+  } catch (err) {
+    console.error('[CRON] job_weekly_slots error', err);
+  } finally {
+    client.release();
+  }
+}
+
+async function sendAbsenceReminderTemplate() {
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    console.log('[CRON] absence_reminder skipped (missing WA config)');
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    console.log('[CRON] absence_reminder start');
+
+    const { rows } = await client.query(`
+      SELECT id, first_name, phone_e164, phone_raw
+      FROM public.users
+      WHERE is_active = true
+        AND (phone_e164 IS NOT NULL OR phone_raw IS NOT NULL)
+    `);
+
+    for (const row of rows) {
+      const raw =
+        row.phone_e164 ||
+        (row.phone_raw ? ('+' + String(row.phone_raw).replace(/^\+?/, '')) : null);
+
+      if (!raw) continue;
+
+      const toNorm = normalizeTo(raw);
+
+      const payload = {
+        messaging_product: 'whatsapp',
+        to: toNorm,
+        type: 'template',
+        template: {
+          name: 'absence_reminder',
+          language: { code: 'pl' }
+          // jeśli template wymaga parametrów, tu dodamy components
+        }
+      };
+
+      const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+      const waMessageId = res.data?.messages?.[0]?.id || null;
+      const status = res.ok ? 'sent' : 'error';
+      const reason = res.ok
+        ? null
+        : (res.status ? `http_${res.status}` : 'send_failed');
+
+      await auditOutbound({
+        userId: row.id,
+        to: toNorm,
+        body: null,
+        messageType: 'template',
+        status,
+        reason,
+        waMessageId,
+        templateName: 'absence_reminder',
+        variables: null
+      });
+    }
+
+    console.log('[CRON] absence_reminder done, processed', rows.length, 'users');
+  } catch (err) {
+    console.error('[CRON] absence_reminder error', err);
+  } finally {
+    client.release();
+  }
 }
 
 async function handleAbsenceInteractive({ client, m, sender }) {
@@ -823,7 +922,33 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
+// =========================
+// CRON JOBS
+// =========================
 
+if (WA_TOKEN && WA_PHONE_ID) {
+  // Niedziela 10:30 – slots week+1
+  cron.schedule(
+    '30 10 * * 0',
+    async () => {
+      await runWeeklySlotsJob();
+    },
+    { timezone: 'Europe/Warsaw' }
+  );
+
+  // Niedziela 17:00 – absence_reminder
+  cron.schedule(
+    '0 17 * * 0',
+    async () => {
+      await sendAbsenceReminderTemplate();
+    },
+    { timezone: 'Europe/Warsaw' }
+  );
+
+  console.log('[CRON] Scheduled weekly_slots (Sun 10:30) and absence_reminder (Sun 17:00)');
+} else {
+  console.log('[CRON] Skipping CRON scheduling (missing WA config)');
+}
 
 // =========================
 // HEALTH / START
