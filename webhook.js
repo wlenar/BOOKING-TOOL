@@ -462,22 +462,19 @@ async function sendMakeupMenu({ client, to, userId }) {
     const d = r.session_date;
     const iso = d instanceof Date
       ? d.toISOString().slice(0, 10)
-      : String(d).slice(0, 10); // YYYY-MM-DD
+      : String(d).slice(0, 10);
 
     const [y, m, dd] = iso.split('-');
-    const label = `${dd}/${m} ${r.session_time?.slice(0, 5) || ''} ${r.group_name}`.trim();
+    const dateLabel = `${dd}/${m}`;
+    const timeLabel = (r.session_time || '').toString().slice(0, 5);
 
-    let title = label;
-    let description = undefined;
-    if (title.length > 24) {
-      description = title.slice(24, 80);
-      title = title.slice(0, 24);
-    }
+    const title = `${dateLabel} ${timeLabel}`.trim();
+    const desc = r.group_name || '';
 
     return {
-      id: `makeup_${r.offer_id}`, // spójne z broadcastem
-      title,
-      ...(description ? { description } : {})
+      id: `makeup_${r.offer_id}`,
+      title: title.substring(0, 24),
+      ...(desc ? { description: desc.substring(0, 80) } : {})
     };
   });
 
@@ -742,13 +739,14 @@ async function runWeeklySlotsBroadcast() {
       if (!listOffers.length) continue;
 
       const rowsList = listOffers.map((o) => {
-        const titleFull = `${o.session_date_label} ${o.session_time_label} ${o.group_name}`;
+        const title = `${o.session_date_label} ${o.session_time_label}`.substring(0, 24);
+        const desc = o.group_name || '';
         return {
-          id: `offer_${o.offer_id}`,              // do późniejszej obsługi wyboru
-          title: titleFull.substring(0, 24),      // wymóg WhatsApp: krótki tytuł
-          description: titleFull.substring(24, 80) || undefined
-        };
-      });
+          id: `makeup_${o.offer_id}`,
+          title,
+        description: desc ? desc.substring(0, 80) : undefined
+      };
+    });
 
       const listPayload = {
         messaging_product: 'whatsapp',
@@ -1004,6 +1002,196 @@ async function handleAbsenceInteractive({ client, m, sender }) {
   }
 
   return false;
+}
+
+async function handleMakeupInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'user' || !sender.active) return false;
+  if (m.type !== 'interactive' || m.interactive?.type !== 'list_reply') return false;
+
+  const reply = m.interactive.list_reply;
+  const id = reply?.id || '';
+  if (!id.startsWith('makeup_')) return false;
+
+  const offerId = parseInt(id.replace('makeup_', ''), 10);
+  if (!offerId || Number.isNaN(offerId)) {
+    await sendText({
+      to: m.from,
+      userId: sender.id,
+      body: 'Nie udało się rozpoznać wybranego terminu. Spróbuj proszę ponownie.'
+    });
+    return true;
+  }
+
+  const userId = sender.id;
+  const to = m.from;
+
+  try {
+    await client.query('BEGIN');
+
+    // 1) Pobierz ofertę + slot + kredyt z blokadą
+    const { rows, rowCount } = await client.query(
+      `
+      SELECT
+        so.id          AS offer_id,
+        so.user_id,
+        so.slot_id,
+        s.session_date,
+        ct.start_time,
+        g.name         AS group_name,
+        uac.balance
+      FROM public.slot_offers so
+      JOIN public.slots s
+        ON s.id = so.slot_id
+      JOIN public.class_templates ct
+        ON ct.id = s.class_template_id
+      JOIN public.groups g
+        ON g.id = ct.group_id
+      JOIN public.user_absence_credits uac
+        ON uac.user_id = so.user_id
+      WHERE so.id = $1
+        AND so.user_id = $2
+        AND so.status IN ('pending', 'sent')
+      FOR UPDATE
+      `,
+      [offerId, userId]
+    );
+
+    if (rowCount === 0) {
+      await client.query('ROLLBACK');
+      await sendText({
+        to,
+        userId,
+        body: 'Nie udało się zarezerwować tego terminu. Wybierz proszę inny z listy.'
+      });
+      return true;
+    }
+
+    const offer = rows[0];
+
+    if (offer.balance <= 0) {
+      await client.query(
+        `UPDATE public.slot_offers
+           SET status = 'error', updated_at = now()
+         WHERE id = $1`,
+        [offerId]
+      );
+      await client.query('COMMIT');
+      await sendText({
+        to,
+        userId,
+        body: 'Nie masz już dostępnych nieobecności do odrabiania.'
+      });
+      return true;
+    }
+
+    // 2) Zajmij slot (race-safe)
+    const updSlot = await client.query(
+      `
+      UPDATE public.slots
+         SET status = 'taken',
+             taken_by_user_id = $1,
+             taken_at = now()
+       WHERE id = $2
+         AND status = 'open'
+         AND taken_by_user_id IS NULL
+       RETURNING id
+      `,
+      [userId, offer.slot_id]
+    );
+
+    if (updSlot.rowCount === 0) {
+      await client.query(
+        `UPDATE public.slot_offers
+           SET status = 'expired', updated_at = now()
+         WHERE id = $1`,
+        [offerId]
+      );
+      await client.query('COMMIT');
+      await sendText({
+        to,
+        userId,
+        body: 'Ten termin został właśnie zajęty przez inną osobę. Wybierz proszę inny.'
+      });
+      return true;
+    }
+
+    // 3) Zmniejsz kredyt
+    const updCred = await client.query(
+      `
+      UPDATE public.user_absence_credits
+         SET balance = balance - 1,
+             updated_at = now()
+       WHERE user_id = $1
+         AND balance > 0
+       RETURNING balance
+      `,
+      [userId]
+    );
+
+    if (updCred.rowCount === 0) {
+      // rollback slotu jeśli coś się omsknęło
+      await client.query(
+        `
+        UPDATE public.slots
+           SET status = 'open',
+               taken_by_user_id = NULL,
+               taken_at = NULL
+         WHERE id = $1
+        `,
+        [offer.slot_id]
+      );
+      await client.query(
+        `UPDATE public.slot_offers
+           SET status = 'error', updated_at = now()
+         WHERE id = $1`,
+        [offerId]
+      );
+      await client.query('COMMIT');
+      await sendText({
+        to,
+        userId,
+        body: 'Nie udało się pobrać kredytu. Rezerwacja została anulowana.'
+      });
+      return true;
+    }
+
+    // 4) Oznacz ofertę jako zaakceptowaną
+    await client.query(
+      `
+      UPDATE public.slot_offers
+         SET status = 'accepted',
+             updated_at = now()
+       WHERE id = $1
+      `,
+      [offerId]
+    );
+
+    await client.query('COMMIT');
+
+    // 5) Potwierdzenie
+    const d = offer.session_date instanceof Date
+      ? offer.session_date.toISOString().slice(0, 10)
+      : String(offer.session_date).slice(0, 10);
+    const [y, m, dd] = d.split('-');
+    const time = (offer.start_time || '').toString().slice(0, 5);
+
+    await sendText({
+      to,
+      userId,
+      body: `✔️ Termin ${dd}/${m} ${time} ${offer.group_name} został zarezerwowany jako odrabianie.`
+    });
+
+    return true;
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    console.error('[makeup] error', err);
+    await sendText({
+      to,
+      userId,
+      body: 'Wystąpił błąd przy rezerwacji tego terminu. Spróbuj ponownie lub wybierz inny.'
+    });
+    return true;
+  }
 }
 
 async function handleMainMenuInteractive({ client, m, sender }) {
@@ -1376,6 +1564,9 @@ app.post('/webhook', async (req, res) => {
           if (m.type === 'interactive') {
             handled = await handleMainMenuInteractive({ client, m, sender });
             if (!handled) {
+              handled = await handleMakeupInteractive({ client, m, sender });
+            }
+            if (!handled) {
               handled = await handleAbsenceInteractive({ client, m, sender });
             }
           }
@@ -1532,14 +1723,14 @@ if (WA_TOKEN && WA_PHONE_ID) {
 
   // Niedziela 17:00 – absence_reminder
   cron.schedule(
-    '0 17 * * 0',
+    '0 18 * * 0',
     async () => {
       await sendAbsenceReminderTemplate();
     },
     { timezone: 'Europe/Warsaw' }
   );
 
-  console.log('[CRON] Scheduled weekly_slots (Sun 10:30) and absence_reminder (Sun 17:00)');
+  console.log('[CRON] Scheduled weekly_slots (Sun 10:30) and absence_reminder (Sun 18:00)');
 } else {
   console.log('[CRON] Skipping CRON scheduling (missing WA config)');
 }
