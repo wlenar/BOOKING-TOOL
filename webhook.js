@@ -402,6 +402,82 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
   return res;
 }
 
+async function sendMainMenu({ to, userId }) {
+  const toNorm = normalizeTo(to);
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    const body =
+      'MENU GŁÓWNE:\n' +
+      '1. Zgłoszenie nieobecności\n' +
+      '2. Odrabianie zajęć\n' +
+      '3. Ilość nieobecności\n' +
+      '4. Zakończ rozmowę';
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body,
+      messageType: 'text',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return;
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: {
+        text:
+          'Wybierz jedną z opcji:\n' +
+          '1. Zgłoszenie nieobecności\n' +
+          '2. Odrabianie zajęć\n' +
+          '3. Ilość nieobecności\n' +
+          '4. Zakończ rozmowę'
+      },
+      action: {
+        button: 'Menu główne',
+        sections: [
+          {
+            title: 'Menu główne',
+            rows: [
+              { id: 'menu_absence', title: 'Zgłoszenie nieobecności' },
+              { id: 'menu_makeup', title: 'Odrabianie zajęć' },
+              { id: 'menu_credits', title: 'Ilość nieobecności' },
+              { id: 'menu_end', title: 'Zakończ rozmowę' }
+            ]
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog =
+    'MENU_GLOWNE: 1-Zgłoszenie nieobecności | 2-Odrabianie zajęć | 3-Ilość nieobecności | 4-Zakończ rozmowę';
+
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok
+    ? null
+    : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_list',
+    status,
+    reason,
+    waMessageId
+  });
+
+  return res;
+}
+
 async function runWeeklySlotsJob() {
   const client = await pool.connect();
   try {
@@ -608,11 +684,68 @@ async function handleAbsenceInteractive({ client, m, sender }) {
   return false;
 }
 
+async function handleMainMenuInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'user' || !sender.active) return false;
+  if (m.type !== 'interactive' || m.interactive?.type !== 'list_reply') {
+    return false;
+  }
+
+  const id = m.interactive.list_reply?.id || '';
+
+  if (id === 'menu_absence') {
+    await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
+    return true;
+  }
+
+  if (id === 'menu_makeup') {
+    // placeholder – do spięcia z logiką odrabiania
+    await sendText({
+      to: m.from,
+      body: 'Odrabianie zajęć: napisz proszę termin, który Cię interesuje, a studio skontaktuje się z Tobą w sprawie dostępnych miejsc.',
+      userId: sender.id
+    });
+    return true;
+  }
+
+  if (id === 'menu_credits') {
+    const { rows } = await client.query(
+      'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
+      [sender.id]
+    );
+    const bal = rows[0]?.balance || 0;
+    await sendText({
+      to: m.from,
+      body: `Masz ${bal} nieobecności do odrobienia.`,
+      userId: sender.id
+    });
+    return true;
+  }
+
+  if (id === 'menu_end') {
+    await sendText({
+      to: m.from,
+      body: 'Dziękujemy za kontakt. Do zobaczenia na zajęciach!',
+      userId: sender.id
+    });
+    return true;
+  }
+
+  return false;
+}
+
 function parseAbsenceCommand(text) {
   if (!text) return null;
 
   const normalized = text.trim().toLowerCase();
-  const m = normalized.match(/^zwalniam\s+(\d{1,2})[./-](\d{1,2})$/);
+
+  // obsługa:
+  // "Zwalniam dd/mm"
+  // "Zwalniam dd.mm"
+  // "Zwalniam dd-mm"
+  // opcjonalnie: "Zwalniam dd/mm o gg:mm"
+  const m = normalized.match(
+    /^zwalniam\s+(\d{1,2})[./-](\d{1,2})(?:\s+o\s+\d{1,2}[:.]\d{2})?$/
+  );
   if (!m) return null;
 
   const day = parseInt(m[1], 10);
@@ -627,6 +760,16 @@ function parseAbsenceCommand(text) {
 
   const ymd = `${year}-${mm}-${dd}`;
   return { ymd };
+}
+
+function parseMainMenuChoice(text) {
+  if (!text) return null;
+  const t = text.trim();
+  if (t === '1') return 'absence';
+  if (t === '2') return 'makeup';
+  if (t === '3') return 'credits';
+  if (t === '4') return 'end';
+  return null;
 }
 
 // =========================
@@ -835,7 +978,10 @@ app.post('/webhook', async (req, res) => {
 
           // 1) Najpierw obsługa odpowiedzi interaktywnych (menu + Tak/Nie)
           if (m.type === 'interactive') {
-            handled = await handleAbsenceInteractive({ client, m, sender });
+            handled = await handleMainMenuInteractive({ client, m, sender });
+            if (!handled) {
+              handled = await handleAbsenceInteractive({ client, m, sender });
+            }
           }
 
           // 2) Obsługa typów nadawcy (jeśli nie przejęła tego logika absencji)
@@ -861,63 +1007,100 @@ app.post('/webhook', async (req, res) => {
 
           // 3) Aktywny user: powitanie + obsługa "Zwalniam dd/mm"
           if (!handled && sender.type === 'user' && sender.active) {
-            handled = true;
+            let localHandled = false;
 
-            // powitanie zawsze na start
-            await sendText({
-              to: m.from,
-              body: `Cześć ${sender.name}!`,
-              userId: sender.id
-            });
+              if (m.text?.body) {
+                const choice = parseMainMenuChoice(m.text.body);
+                if (choice === 'absence') {
+                  await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
+                  localHandled = true;
+                } else if (choice === 'makeup') {
+                  await sendText({
+                    to: m.from,
+                    body: 'Odrabianie zajęć: napisz proszę termin, który Cię interesuje, a studio potwierdzi dostępność.',
+                    userId: sender.id
+                  });
+                  localHandled = true;
+                } else if (choice === 'credits') {
+                  const { rows } = await client.query(
+                    'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
+                    [sender.id]
+                  );
+                  const bal = rows[0]?.balance || 0;
+                    await sendText({
+                      to: m.from,
+                      body: `Masz ${bal} nieobecności do odrobienia.`,
+                      userId: sender.id
+                    });
+                    localHandled = true;
+                  } else if (choice === 'end') {
+                    await sendText({
+                      to: m.from,
+                      body: 'Dziękujemy za kontakt. Do zobaczenia!',
+                      userId: sender.id
+                    });
+                    localHandled = true;
+                  }
 
-            // jeśli jest komenda "Zwalniam dd/mm" → próbujemy zgłosić nieobecność
-            if (m.text?.body) {
-              const parsed = parseAbsenceCommand(m.text.body);
-              if (parsed) {
-                const result = await processAbsence(client, sender.id, parsed.ymd);
+                  if (!localHandled) {
+                    const parsed = parseAbsenceCommand(m.text.body);
+                    if (parsed) {
+                      const result = await processAbsence(client, sender.id, parsed.ymd);
 
-                if (result.ok) {
-                  await sendText({
-                    to: m.from,
-                    body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`,
-                    userId: sender.id
-                  });
-                  await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
-                } else if (result.reason === 'past_date') {
-                  await sendText({
-                    to: m.from,
-                    body: 'Nie możesz zwolnić zajęć z datą w przeszłości.',
-                    userId: sender.id
-                  });
-                } else if (result.reason === 'already_absent') {
-                  await sendText({
-                    to: m.from,
-                    body: 'Na te zajęcia jest już zgłoszona nieobecność.',
-                    userId: sender.id
-                  });
-                  await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
-                } else if (result.reason === 'no_enrollment_for_weekday') {
-                  await sendText({
-                    to: m.from,
-                    body: 'Nie znalazłem Twoich zajęć w tym terminie.',
-                    userId: sender.id
-                  });
-                  await sendUpcomingClassesMenu({
-                    client,
-                    to: m.from,
-                    userId: sender.id
-                  });
-                } else {
-                  await sendText({
-                    to: m.from,
-                    body: 'Coś poszło nie tak przy zgłaszaniu nieobecności. Spróbuj ponownie lub skontaktuj się ze studiem.',
-                    userId: sender.id
-                  });
-                }
+                      if (result.ok) {
+                        await sendText({
+                          to: m.from,
+                          body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`,
+                          userId: sender.id
+                        });
+                        await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+                      } else if (result.reason === 'past_date') {
+                        await sendText({
+                          to: m.from,
+                          body: 'Nie możesz zwolnić zajęć z datą w przeszłości.',
+                          userId: sender.id
+                        });
+                      } else if (result.reason === 'already_absent') {
+                        await sendText({
+                          to: m.from,
+                          body: 'Na te zajęcia jest już zgłoszona nieobecność.',
+                          userId: sender.id
+                        });
+                        await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+                      } else if (result.reason === 'no_enrollment_for_weekday') {
+                        await sendText({
+                          to: m.from,
+                          body: 'Nie znalazłem Twoich zajęć w tym terminie.',
+                          userId: sender.id
+                        });
+                        await sendUpcomingClassesMenu({
+                          client,
+                          to: m.from,
+                          userId: sender.id
+                        });
+                      } else {
+                        await sendText({
+                          to: m.from,
+                          body: 'Coś poszło nie tak przy zgłaszaniu nieobecności. Spróbuj ponownie lub skontaktuj się ze studiem.',
+                          userId: sender.id
+                        });
+                        localHandled = true;
+                      }
+                    }
+                  }
+                  if (!localHandled) {
+                    await sendText({
+                      to: m.from,
+                      body: `Cześć ${sender.name}!`,
+                      userId: sender.id
+                    });
+                    await sendMainMenu({ to: m.from, userId: sender.id });
+                    localHandled = true;
+                  }
               }
-            }
-            // jeśli brak komendy → zostaje samo "Cześć <imię>!"
-          }
+
+              handled = handled || localHandled;
+          }     
         }
       }
     }
