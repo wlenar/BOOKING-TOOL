@@ -405,6 +405,7 @@ async function handleAbsenceInteractive({ client, m, sender }) {
     if (parts.length < 3) return false;
 
     const ymd = parts[1];
+    const classTemplateId = Number(parts[2]) || null;
 
     // czy już jest absencja na ten dzień?
     const existing = await client.query(
@@ -412,10 +413,11 @@ async function handleAbsenceInteractive({ client, m, sender }) {
       SELECT id
       FROM public.absences
       WHERE user_id = $1
-        AND session_date = $2::date
+        AND class_template_id = $2
+        AND session_date = $3::date
       LIMIT 1
       `,
-      [sender.id, ymd]
+      [sender.id, classTemplateId, ymd]
     );
 
     if (existing.rowCount > 0) {
@@ -434,6 +436,26 @@ async function handleAbsenceInteractive({ client, m, sender }) {
       await sendText({
         to: m.from,
         body: `✔️ Nieobecność ${ymd} została zgłoszona, miejsce zwolnione.`,
+        userId: sender.id
+      });
+      await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+      return true;
+    }
+    
+    if (result.reason === 'already_absent') {
+      await sendText({
+        to: m.from,
+        body: `Na te zajęcia (${ymd}) jest już zgłoszona nieobecność.`,
+        userId: sender.id
+      });
+      await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+      return true;
+    }
+
+    if (result.reason === 'past_date') {
+      await sendText({
+        to: m.from,
+        body: 'Nie możesz zwolnić zajęć z datą w przeszłości.',
         userId: sender.id
       });
       await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
@@ -481,35 +503,91 @@ async function handleAbsenceInteractive({ client, m, sender }) {
 }
 
 // =========================
-// Główna operacja: zgłoszenie nieobecności + utworzenie wolnego slotu
+// Główna operacja: zgłoszenie nieobecności + slot + kredyt
 // =========================
-async function processAbsence(client, userId, ymd) {
+async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
   try {
     await client.query('BEGIN');
 
-    // 1) znajdź class_template_id, do którego user jest przypisany w ten dzień tygodnia
-    const ctRes = await client.query(
-      `
-      SELECT ct.id AS class_template_id
-      FROM public.enrollments e
-      JOIN public.class_templates ct ON ct.id = e.class_template_id
-      WHERE e.user_id = $1
-        AND ct.is_active = true
-        AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
-      LIMIT 1
-      `,
-      [userId, ymd]
+    // 0) blokada dat w przeszłości
+    const pastCheck = await client.query(
+      'SELECT $1::date < CURRENT_DATE AS is_past',
+      [ymd]
     );
-
-    // jeśli brak przypisania → nie ma zajęć w ten dzień
-    if (ctRes.rowCount === 0) {
+    if (pastCheck.rows[0]?.is_past) {
       await client.query('ROLLBACK');
-      return { ok: false, reason: 'no_enrollment_for_weekday' };
+      return { ok: false, reason: 'past_date' };
     }
 
-    const classTemplateId = ctRes.rows[0].class_template_id;
+    let classTemplateId = classTemplateIdHint;
 
-    // 2) wpis do absences (audit, narastająco)
+    // 1) ustalenie class_template_id
+
+    if (classTemplateId) {
+      // weryfikacja: user jest zapisany na te zajęcia i dzień tygodnia się zgadza
+      const chk = await client.query(
+        `
+        SELECT 1
+        FROM public.enrollments e
+        JOIN public.class_templates ct ON ct.id = e.class_template_id
+        WHERE e.user_id = $1
+          AND ct.id = $2
+          AND ct.is_active = true
+          AND ct.weekday_iso = EXTRACT(ISODOW FROM $3::date)::int
+        LIMIT 1
+        `,
+        [userId, classTemplateId, ymd]
+      );
+      if (chk.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'no_enrollment_for_weekday' };
+      }
+    } else {
+      // tryb z komendy tekstowej: bierzemy pierwsze zajęcia usera w ten dzień
+      const ctRes = await client.query(
+        `
+        SELECT ct.id AS class_template_id
+        FROM public.enrollments e
+        JOIN public.class_templates ct ON ct.id = e.class_template_id
+        WHERE e.user_id = $1
+          AND ct.is_active = true
+          AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
+        ORDER BY ct.start_time
+        LIMIT 1
+        `,
+        [userId, ymd]
+      );
+      if (ctRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'no_enrollment_for_weekday' };
+      }
+      classTemplateId = ctRes.rows[0].class_template_id;
+    }
+
+    // 2) czy absencja już istnieje
+    const existingAbs = await client.query(
+      `
+      SELECT id
+      FROM public.absences
+      WHERE user_id = $1
+        AND class_template_id = $2
+        AND session_date = $3::date
+      LIMIT 1
+      `,
+      [userId, classTemplateId, ymd]
+    );
+
+    if (existingAbs.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return {
+        ok: false,
+        reason: 'already_absent',
+        absence_id: existingAbs.rows[0].id,
+        class_template_id: classTemplateId
+      };
+    }
+
+    // 3) nowa absencja
     const absRes = await client.query(
       `
       INSERT INTO public.absences (
@@ -520,20 +598,14 @@ async function processAbsence(client, userId, ymd) {
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3::date, 'whatsapp_bezposrednia_wiadomosc', now(), now())
-      ON CONFLICT (user_id, session_date)
-      DO UPDATE SET
-        class_template_id = EXCLUDED.class_template_id,
-        reason            = EXCLUDED.reason,
-        updated_at        = now()
+      VALUES ($1, $2, $3::date, 'whatsapp', now(), now())
       RETURNING id
       `,
       [userId, classTemplateId, ymd]
     );
-
     const absenceId = absRes.rows[0].id;
 
-    // 3) utworzenie wolnego slotu powiązanego z absencją
+    // 4) wolny slot (unikamy duplikatu na tym samym absence_id, jeśli masz constraint, ON CONFLICT zadziała)
     await client.query(
       `
       INSERT INTO public.slots (
@@ -556,8 +628,22 @@ async function processAbsence(client, userId, ymd) {
         now(),
         now()
       )
+      ON CONFLICT DO NOTHING
       `,
       [classTemplateId, ymd, absenceId]
+    );
+
+    // 5) aktualizacja kredytu
+    await client.query(
+      `
+      INSERT INTO public.user_absence_credits (user_id, balance, updated_at)
+      VALUES ($1, 1, now())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        balance = user_absence_credits.balance + 1,
+        updated_at = now()
+      `,
+      [userId]
     );
 
     await client.query('COMMIT');
@@ -567,27 +653,6 @@ async function processAbsence(client, userId, ymd) {
     console.error('[processAbsence] error', err);
     return { ok: false, reason: 'exception', error: err.message };
   }
-}
-
-// =========================
-// PARSER KOMEND (Zwalniam dd/mm)
-// =========================
-function parseAbsenceCommand(text) {
-  const m = text.trim().match(/^zwalniam\s+(\d{1,2})[./-](\d{1,2})$/i);
-  if (!m) return null;
-
-  const day = parseInt(m[1], 10);
-  const month = parseInt(m[2], 10);
-
-  const now = new Date();
-  const currentMonth = now.getMonth() + 1;
-  let year = now.getFullYear();
-  if (month < currentMonth) year += 1; // grudzień → styczeń
-
-  const pad = n => String(n).padStart(2, '0');
-  const ymd = `${year}-${pad(month)}-${pad(day)}`;
-
-  return { ymd };
 }
 
 // =========================
@@ -688,6 +753,19 @@ app.post('/webhook', async (req, res) => {
                   await sendText({
                     to: m.from,
                     body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`,
+                    userId: sender.id
+                  });
+                  await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+                } else if (result.reason === 'past_date') {
+                  await sendText({
+                    to: m.from,
+                    body: 'Nie możesz zwolnić zajęć z datą w przeszłości.',
+                    userId: sender.id
+                  });
+                } else if (result.reason === 'already_absent') {
+                  await sendText({
+                    to: m.from,
+                    body: 'Na te zajęcia jest już zgłoszona nieobecność.',
                     userId: sender.id
                   });
                   await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
