@@ -491,6 +491,203 @@ async function runWeeklySlotsJob() {
   }
 }
 
+async function runWeeklySlotsBroadcast() {
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    console.log('[CRON] weekly_slots_broadcast skipped (missing WA config)');
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    console.log('[CRON] weekly_slots_broadcast start');
+
+    // 1) Przygotuj oferty w bazie (logika w SQL)
+    await client.query('SELECT public.job_prepare_weekly_slot_offers();');
+
+    // 2) Pobierz pending oferty + opis slotów
+    const { rows } = await client.query(`
+      SELECT
+        so.id AS offer_id,
+        so.user_id,
+        u.first_name,
+        COALESCE(
+          u.phone_e164,
+          CASE
+            WHEN u.phone_raw IS NOT NULL
+            THEN '+' || REGEXP_REPLACE(u.phone_raw, '^\\+?', '')
+            ELSE NULL
+          END
+        ) AS phone,
+        os.slot_id,
+        to_char(os.session_date, 'DD.MM')   AS session_date_label,
+        to_char(os.session_time, 'HH24:MI') AS session_time_label,
+        os.group_name
+      FROM public.slot_offers so
+      JOIN public.users u
+        ON u.id = so.user_id
+      JOIN public.v_open_slots_desc os
+        ON os.slot_id = so.slot_id
+      WHERE
+            so.status = 'pending'
+        AND os.session_date >= current_date
+        AND os.session_date <  current_date + interval '7 days'
+        AND os.free_capacity_remaining > 0
+      ORDER BY so.user_id, os.session_date, os.session_time, os.group_name
+    `);
+
+    if (!rows.length) {
+      console.log('[CRON] weekly_slots_broadcast no pending offers');
+      return;
+    }
+
+    // 3) Grupowanie po użytkowniku
+    const byUser = new Map();
+    for (const r of rows) {
+      if (!r.phone) continue;
+      let u = byUser.get(r.user_id);
+      if (!u) {
+        u = {
+          userId: r.user_id,
+          firstName: r.first_name || '',
+          phone: r.phone,
+          offers: []
+        };
+        byUser.set(r.user_id, u);
+      }
+      u.offers.push(r);
+    }
+
+    // 4) Wysyłka: template weekly_slots_update + lista interaktywna
+    for (const u of byUser.values()) {
+      const toNorm = normalizeTo(u.phone);
+      if (!toNorm) continue;
+
+      const firstName = u.firstName || '';
+
+      // 4a) Template otwierający okno (weekly_slots_update)
+      const tplPayload = {
+        messaging_product: 'whatsapp',
+        to: toNorm,
+        type: 'template',
+        template: {
+          name: 'weekly_slots_update',
+          language: { code: 'pl' },
+          components: [
+            {
+              type: 'body',
+              parameters: [
+                { type: 'text', text: firstName }
+              ]
+            }
+          ]
+        }
+      };
+
+      const tplRes = await postWA({ phoneId: WA_PHONE_ID, payload: tplPayload });
+      const tplWaMessageId = tplRes.data?.messages?.[0]?.id || null;
+      const tplStatus = tplRes.ok ? 'sent' : 'error';
+      const tplReason = tplRes.ok ? null : (tplRes.status ? `http_${tplRes.status}` : 'send_failed');
+
+      await auditOutbound({
+        userId: u.userId,
+        to: toNorm,
+        body: null,
+        messageType: 'template',
+        status: tplStatus,
+        reason: tplReason,
+        waMessageId: tplWaMessageId,
+        templateName: 'weekly_slots_update',
+        variables: JSON.stringify([firstName])
+      });
+
+      if (!tplRes.ok) {
+        // Oznacz oferty jako error (żeby nie mielić w kółko)
+        const errOfferIds = u.offers.map(o => o.offer_id);
+        await client.query(
+          `UPDATE public.slot_offers
+             SET status = 'error', updated_at = now()
+           WHERE id = ANY($1::bigint[])`,
+          [errOfferIds]
+        );
+        continue;
+      }
+
+      // 4b) Lista interaktywna (max 10 pozycji)
+      const listOffers = u.offers.slice(0, 10);
+      if (!listOffers.length) continue;
+
+      const rowsList = listOffers.map((o) => {
+        const titleFull = `${o.session_date_label} ${o.session_time_label} ${o.group_name}`;
+        return {
+          id: `offer_${o.offer_id}`,              // do późniejszej obsługi wyboru
+          title: titleFull.substring(0, 24),      // wymóg WhatsApp: krótki tytuł
+          description: titleFull.substring(24, 80) || undefined
+        };
+      });
+
+      const listPayload = {
+        messaging_product: 'whatsapp',
+        to: toNorm,
+        type: 'interactive',
+        interactive: {
+          type: 'list',
+          body: {
+            text: 'Wybierz termin zajęć, który chcesz wykorzystać na odrabianie.'
+          },
+          action: {
+            button: 'Wybierz termin',
+            sections: [
+              {
+                title: 'Dostępne miejsca',
+                rows: rowsList
+              }
+            ]
+          }
+        }
+      };
+
+      const listRes = await postWA({ phoneId: WA_PHONE_ID, payload: listPayload });
+      const listWaMessageId = listRes.data?.messages?.[0]?.id || null;
+      const listStatus = listRes.ok ? 'sent' : 'error';
+      const listReason = listRes.ok ? null : (listRes.status ? `http_${listRes.status}` : 'send_failed');
+
+      await auditOutbound({
+        userId: u.userId,
+        to: toNorm,
+        body: 'WEEKLY_SLOTS_LIST: ' + rowsList.map(r => r.title).join(' | '),
+        messageType: 'interactive_list',
+        status: listStatus,
+        reason: listReason,
+        waMessageId: listWaMessageId
+      });
+
+      if (listRes.ok) {
+        const sentOfferIds = listOffers.map(o => o.offer_id);
+        await client.query(
+          `UPDATE public.slot_offers
+             SET status = 'sent', updated_at = now()
+           WHERE id = ANY($1::bigint[])`,
+          [sentOfferIds]
+        );
+      } else {
+        const errOfferIds = listOffers.map(o => o.offer_id);
+        await client.query(
+          `UPDATE public.slot_offers
+             SET status = 'error', updated_at = now()
+           WHERE id = ANY($1::bigint[])`,
+          [errOfferIds]
+        );
+      }
+    }
+
+    console.log('[CRON] weekly_slots_broadcast done, users:', byUser.size);
+  } catch (err) {
+    console.error('[CRON] weekly_slots_broadcast error', err);
+  } finally {
+    client.release();
+  }
+}
+
 async function sendAbsenceReminderTemplate() {
   if (!WA_TOKEN || !WA_PHONE_ID) {
     console.log('[CRON] absence_reminder skipped (missing WA config)');
@@ -1240,6 +1437,22 @@ app.get('/cron/manual-absence-reminder', async (req, res) => {
   } catch (err) {
     console.error('[MANUAL] absence_reminder error', err);
     return res.status(500).send('error');
+  }
+});
+
+app.get('/debug/run-weekly-slots', async (req, res) => {
+  // prosty prymitywny safeguard
+  const token = req.query.token;
+  if (!token || token !== process.env.DEBUG_TOKEN) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+
+  try {
+    await runWeeklySlotsBroadcast();
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[DEBUG] run-weekly-slots error', err);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
 
