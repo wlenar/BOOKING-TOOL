@@ -1735,6 +1735,15 @@ if (WA_TOKEN && WA_PHONE_ID) {
   console.log('[CRON] Skipping CRON scheduling (missing WA config)');
 }
 
+// Niedziela 20:00 – broadcast wolnych slotów do kwalifikujących się użytkowników
+cron.schedule(
+  '0 20 * * 0',
+  async () => {
+    await runWeeklySlotsBroadcast();
+  },
+  { timezone: 'Europe/Warsaw' }
+);
+
 // Ręczny trigger absence_reminder (tylko do testów!)
 app.get('/cron/manual-absence-reminder', async (req, res) => {
   const token = req.query.token || '';
