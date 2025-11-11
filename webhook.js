@@ -234,10 +234,10 @@ async function sendMainMenu({ to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: 'Co chcesz zrobić?'
+        text: '🍂 Witaj w studiu Pilates!\nCo chcesz dziś zrobić?\n\nWpisz numer lub wybierz z listy 👇'
       },
       action: {
-        button: 'Otwórz menu',
+        button: '📋Otwórz menu',
         sections: [
           {
             title: 'Dostępne opcje',
