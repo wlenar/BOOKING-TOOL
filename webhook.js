@@ -1239,7 +1239,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     if (id === 'menu_end') {
       await sendText({
         to: m.from,
-        body: '💛 Dziękujemy! Do zobaczenia na macie!',
+        body: '💛 Dziękujemy! Do zobaczenia w studiu!',
         userId: sender.id
       });
       return true;
@@ -1330,7 +1330,6 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
     let classTemplateId = classTemplateIdHint;
 
     // 1) ustalenie class_template_id
-
     if (classTemplateId) {
       // weryfikacja: user jest zapisany na te zajęcia i dzień tygodnia się zgadza
       const chk = await client.query(
@@ -1351,7 +1350,7 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
         return { ok: false, reason: 'no_enrollment_for_weekday' };
       }
     } else {
-      // tryb z komendy tekstowej: bierzemy pierwsze zajęcia usera w ten dzień
+      // tryb z komendy tekstowej: pierwsze zajęcia usera w ten dzień
       const ctRes = await client.query(
         `
         SELECT ct.id AS class_template_id
@@ -1413,7 +1412,7 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
     );
     const absenceId = absRes.rows[0].id;
 
-    // 4) wolny slot (unikamy duplikatu na tym samym absence_id, jeśli masz constraint, ON CONFLICT zadziała)
+    // 4) wolny slot
     await client.query(
       `
       INSERT INTO public.slots (
@@ -1455,6 +1454,66 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
     );
 
     await client.query('COMMIT');
+
+    // 6) powiadomienie instruktora (best-effort, poza transakcją)
+    try {
+      const { rows: infoRows } = await client.query(
+        `
+        SELECT
+          u.first_name                         AS user_first_name,
+          COALESCE(u.last_name, '')            AS user_last_name,
+          g.name                               AS group_name,
+          to_char($2::date, 'DD.MM')           AS session_date_label,
+          ct.start_time,
+          i.first_name                         AS instr_first_name,
+          COALESCE(
+            i.phone_e164,
+            CASE
+              WHEN i.phone_raw IS NOT NULL
+              THEN '+' || REGEXP_REPLACE(i.phone_raw, '^\\+?', '')
+              ELSE NULL
+            END
+          )                                    AS instr_phone
+        FROM public.users u
+        JOIN public.enrollments e
+          ON e.user_id = u.id
+        JOIN public.class_templates ct
+          ON ct.id = e.class_template_id
+         AND ct.id = $3
+        JOIN public.groups g
+          ON g.id = ct.group_id
+        JOIN public.instructors i
+          ON i.id = g.instructor_id
+        WHERE u.id = $1
+        LIMIT 1
+        `,
+        [userId, ymd, classTemplateId]
+      );
+
+      const info = infoRows[0];
+      if (info && info.instr_phone) {
+        const timeLabel = info.start_time
+          ? info.start_time.toString().slice(0, 5)
+          : '';
+        const userFullName = (info.user_first_name || '') +
+          (info.user_last_name ? ` ${info.user_last_name}` : '');
+        const who = userFullName.trim() || 'Klient';
+
+        const body =
+          `Info: ${who} zgłosił nieobecność ${info.session_date_label}` +
+          (timeLabel ? ` ${timeLabel}` : '') +
+          ` na grupie ${info.group_name}. Miejsce zostało zwolnione do odrabiania.`;
+
+        await sendText({
+          to: info.instr_phone,
+          body,
+          userId: null
+        });
+      }
+    } catch (notifyErr) {
+      console.error('[processAbsence] notify instructor error', notifyErr);
+    }
+
     return { ok: true, absence_id: absenceId, class_template_id: classTemplateId };
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1912,6 +1971,10 @@ async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
       ON g.id = ct.group_id
      AND g.is_active = true
      AND g.instructor_id = $1
+    WHERE
+      -- tylko przyszłość:
+      d.d > current_date
+      OR (d.d = current_date AND ct.start_time > now()::time)
     ORDER BY d.d, ct.start_time, g.name
     LIMIT 10
     `,
@@ -1921,14 +1984,14 @@ async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
   if (!rows.length) {
     await sendText({
       to: toNorm,
-      body: 'Brak Twoich zajęć w najbliższych 7 dniach – nie mogę dodać wolnego miejsca.'
+      body: 'Brak dostępnych najbliższych terminów, dla których można dodać wolne miejsce.'
     });
     return;
   }
 
   const listRows = rows.map(r => {
     const iso = r.session_date.toISOString().slice(0,10); // YYYY-MM-DD
-    const [y,m,d] = iso.split('-');
+    const [y, m, d] = iso.split('-');
     const dateLabel = `${d}/${m}`;
     const timeLabel = r.start_time.toString().slice(0,5);
     let title = `${dateLabel} ${timeLabel}`;
@@ -1947,7 +2010,7 @@ async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
     interactive: {
       type: 'list',
       body: {
-        text: 'Wybierz zajęcia, dla których chcesz dodać jedno dodatkowe wolne miejsce:'
+        text: 'Wybierz przyszłe zajęcia, dla których chcesz dodać jedno dodatkowe wolne miejsce:'
       },
       action: {
         button: '➕ Wybierz termin',
@@ -1979,14 +2042,14 @@ async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
 }
 
 async function handleInstructorAddSlotSelection({ client, m, sender }) {
-  const to = m.from;
-  const toNorm = normalizeTo(to);
+  const toNorm = normalizeTo(m.from);
 
   const reply = m.interactive?.list_reply;
   const id = reply?.id || '';
   if (!id.startsWith('instr_addslot_')) return false;
 
-  const parts = id.split('_'); // instr_addslot_YYYY-MM-DD_classTemplateId
+  // format: instr_addslot_YYYY-MM-DD_classTemplateId
+  const parts = id.split('_');
   if (parts.length !== 4) {
     await sendText({
       to: toNorm,
@@ -2005,47 +2068,35 @@ async function handleInstructorAddSlotSelection({ client, m, sender }) {
     return true;
   }
 
-  // sprawdź, czy ten class_template należy do instruktora i nie przekroczymy pojemności
+  // blokada dat wstecz
+  const { rows: pastRows } = await client.query(
+    'SELECT $1::date < current_date AS is_past',
+    [ymd]
+  );
+  if (pastRows[0]?.is_past) {
+    await sendText({
+      to: toNorm,
+      body: 'Nie możesz dodać miejsca na termin w przeszłości.'
+    });
+    return true;
+  }
+
+  // sprawdź, czy class_template należy do tego instruktora
   const { rows } = await client.query(
     `
-    WITH grp AS (
-      SELECT
-        g.id            AS group_id,
-        g.max_capacity,
-        g.instructor_id
-      FROM public.class_templates ct
-      JOIN public.groups g ON g.id = ct.group_id
-      WHERE ct.id = $2
-      LIMIT 1
-    ),
-    enrolled AS (
-      SELECT COUNT(*) AS enrolled_count
-      FROM public.enrollments e
-      WHERE e.class_template_id = $2
-    ),
-    used AS (
-      SELECT
-        SUM(CASE WHEN s.status = 'open'  THEN 1 ELSE 0 END) AS open_cnt,
-        SUM(CASE WHEN s.status = 'taken' THEN 1 ELSE 0 END) AS taken_cnt
-      FROM public.slots s
-      WHERE s.class_template_id = $2
-        AND s.session_date = $3::date
-    )
     SELECT
-      grp.max_capacity,
-      grp.instructor_id,
-      COALESCE(enrolled.enrolled_count,0) AS enrolled_count,
-      COALESCE(used.open_cnt,0)          AS open_cnt,
-      COALESCE(used.taken_cnt,0)         AS taken_cnt
-    FROM grp
-    LEFT JOIN enrolled ON true
-    LEFT JOIN used     ON true
+      g.instructor_id,
+      g.name        AS group_name,
+      ct.start_time AS start_time
+    FROM public.class_templates ct
+    JOIN public.groups g ON g.id = ct.group_id
+    WHERE ct.id = $1
+    LIMIT 1
     `,
-    [sender.id, classTemplateId, ymd]
+    [classTemplateId]
   );
 
   const row = rows[0];
-
   if (!row || row.instructor_id !== sender.id) {
     await sendText({
       to: toNorm,
@@ -2054,15 +2105,7 @@ async function handleInstructorAddSlotSelection({ client, m, sender }) {
     return true;
   }
 
-  const usedTotal = row.enrolled_count + row.open_cnt + row.taken_cnt;
-  if (usedTotal >= row.max_capacity) {
-    await sendText({
-      to: toNorm,
-      body: 'Nie można dodać kolejnego miejsca – osiągnięto maksymalną pojemność grupy.'
-    });
-    return true;
-  }
-
+  // ręczne otwarcie dodatkowego miejsca (bez ograniczania do max_capacity)
   await client.query(
     `
     INSERT INTO public.slots (
@@ -2080,10 +2123,13 @@ async function handleInstructorAddSlotSelection({ client, m, sender }) {
     [classTemplateId, ymd]
   );
 
-  const [Y,M,D] = ymd.split('-');
+  const [Y, M, D] = ymd.split('-');
+  const timeLabel = row.start_time
+    ? row.start_time.toString().slice(0, 5)
+    : '';
   await sendText({
     to: toNorm,
-    body: `Dodano jedno wolne miejsce na zajęcia ${D}/${M}.`
+    body: `Dodano jedno wolne miejsce na ${D}/${M} ${timeLabel} (${row.group_name}).`
   });
 
   return true;
