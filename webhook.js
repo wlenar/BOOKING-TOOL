@@ -234,7 +234,13 @@ async function sendMainMenu({ to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: '🍂 Witaj w studiu Pilates!\nCo chcesz dziś zrobić?\n\nWpisz numer lub wybierz z listy 👇'
+        text: '🍂 Witaj w studiu Pilates!\n'+
+        'Co chcesz dziś zrobić?🍂\n\n'+
+        '1️⃣ Zgłoszenie nieobecności\n' +
+        '2️⃣ Odrabianie zajęć\n' +
+        '3️⃣ Ilość nieobecności\n' +
+        '4️⃣ Zakończ rozmowę\n\n' +
+        'Wpisz numer lub wybierz z listy 👇'
       },
       action: {
         button: '📋Otwórz menu',
