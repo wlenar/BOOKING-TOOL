@@ -214,7 +214,6 @@ async function getUpcomingUserClasses(client, userId) {
 async function sendMainMenu({ to, userId }) {
   const toNorm = normalizeTo(to);
 
-  // jeśli brak konfiguracji WA – logujemy i wychodzimy
   if (!WA_TOKEN || !WA_PHONE_ID) {
     await auditOutbound({
       userId,
@@ -234,16 +233,17 @@ async function sendMainMenu({ to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: '🍂 Witaj w studiu Pilates!\n'+
-        'Co chcesz dziś zrobić?🍂\n\n'+
-        '1️⃣ Zgłoszenie nieobecności\n' +
-        '2️⃣ Odrabianie zajęć\n' +
-        '3️⃣ Ilość nieobecności\n' +
-        '4️⃣ Zakończ rozmowę\n\n' +
-        'Wpisz numer lub wybierz z listy 👇'
+        text:
+          '🍂 Witaj w studiu Pilates!\n' +
+          'Co chcesz dziś zrobić?\n\n' +
+          '1️⃣ Zgłoszenie nieobecności\n' +
+          '2️⃣ Odrabianie zajęć\n' +
+          '3️⃣ Ilość nieobecności\n' +
+          '4️⃣ Zakończ rozmowę\n\n' +
+          'Wybierz z listy lub wpisz numer 👇'
       },
       action: {
-        button: '📋Otwórz menu',
+        button: '📋 Otwórz menu',
         sections: [
           {
             title: 'Dostępne opcje',
@@ -251,12 +251,12 @@ async function sendMainMenu({ to, userId }) {
               {
                 id: 'menu_absence',
                 title: 'Zgłoś nieobecność',
-                description: 'Zwolnij miejsce na konkretne zajęcia'
+                description: 'Wybierz termin z listy swoich zajęć'
               },
               {
                 id: 'menu_makeup',
                 title: 'Odrabianie zajęć',
-                description: 'Zarezerwuj termin z wolnych miejsc'
+                description: 'Wybierz wolny termin do odrabiania'
               },
               {
                 id: 'menu_credits',
@@ -266,7 +266,7 @@ async function sendMainMenu({ to, userId }) {
               {
                 id: 'menu_end',
                 title: 'Zakończ rozmowę',
-                description: 'Zamknij rozmowę bez zmian'
+                description: 'Zakończ bez wprowadzania zmian'
               }
             ]
           }
@@ -328,19 +328,19 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
   }
 
   const sectionRows = rows
-    .slice(0, 10) // WA: max 10 wierszy w sekcji
+    .slice(0, 10)
     .map((row) => {
       const rawDate = row.session_date;
       const iso = rawDate instanceof Date
         ? rawDate.toISOString().slice(0, 10)
-        : String(rawDate).slice(0, 10); // YYYY-MM-DD
+        : String(rawDate).slice(0, 10);
 
       const [y, m, d] = iso.split('-');
       const yy = y.slice(2, 4);
 
       let title = `${d}/${m}/${yy} ${row.group_name}`;
       if (title.length > 24) {
-        title = title.slice(0, 24); // twardy limit WA
+        title = title.slice(0, 24);
       }
 
       const id = `absence_${iso}_${row.class_template_id}`;
@@ -354,13 +354,13 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: 'Wybierz termin zajęć, dla których chcesz zgłosić nieobecność, lub wybierz "Inny termin".'
+        text: '📅 Wybierz zajęcia, które chcesz zwolnić:'
       },
       action: {
-        button: '🗓️Wybierz termin',
+        button: '🗓️ Wybierz termin',
         sections: [
           {
-            title: 'Twoje zajęcia',
+            title: 'Twoje najbliższe zajęcia',
             rows: sectionRows
           },
           {
@@ -369,7 +369,7 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
               {
                 id: 'absence_other_date',
                 title: 'Inny termin',
-                description: 'Podam inny termin w wiadomości'
+                description: 'Podam datę w wiadomości'
               }
             ]
           }
@@ -1527,7 +1527,7 @@ app.post('/webhook', async (req, res) => {
                       if (result.ok) {
                         await sendText({
                           to: m.from,
-                          body: `✔️ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`,
+                          body: `✅ Nieobecność ${parsed.ymd} została zgłoszona, miejsce zwolnione.`,
                           userId: sender.id
                         });
                         await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
@@ -1535,14 +1535,14 @@ app.post('/webhook', async (req, res) => {
                       } else if (result.reason === 'past_date') {
                         await sendText({
                           to: m.from,
-                          body: 'Nie możesz zwolnić zajęć z datą w przeszłości.',
+                          body: '❗️Nie możesz zwolnić zajęć z datą w przeszłości.',
                           userId: sender.id
                         });
                         localHandled = true;
                       } else if (result.reason === 'already_absent') {
                         await sendText({
                           to: m.from,
-                          body: 'Na te zajęcia jest już zgłoszona nieobecność.',
+                          body: '💬Na te zajęcia jest już zgłoszona nieobecność.',
                           userId: sender.id
                         });
                         await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
@@ -1550,7 +1550,7 @@ app.post('/webhook', async (req, res) => {
                       } else if (result.reason === 'no_enrollment_for_weekday') {
                         await sendText({
                           to: m.from,
-                          body: 'Nie znalazłem Twoich zajęć w tym terminie.',
+                          body: '❗️Nie znalazłem Twoich zajęć w tym terminie.',
                           userId: sender.id
                         });
                         await sendUpcomingClassesMenu({
@@ -1562,7 +1562,7 @@ app.post('/webhook', async (req, res) => {
                       } else {
                         await sendText({
                           to: m.from,
-                          body: 'Coś poszło nie tak przy zgłaszaniu nieobecności. Spróbuj ponownie lub skontaktuj się ze studiem.',
+                          body: '❗️Coś poszło nie tak przy zgłaszaniu nieobecności. Spróbuj ponownie lub skontaktuj się ze studiem.',
                           userId: sender.id
                         });
                         localHandled = true;
