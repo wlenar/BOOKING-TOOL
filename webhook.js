@@ -179,6 +179,91 @@ async function resolveSenderType(client, wa) {
   return { type: 'none' };
 }
 
+async function sendInstructorMenu({ to, instructorId }) {
+  const toNorm = normalizeTo(to);
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: null,
+      to: toNorm,
+      body: 'INSTR_MENU: pominięte (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_list',
+      status: 'skipped',
+      reason: 'missing_credentials'
+    });
+    return;
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: {
+        text: '📚 Panel instruktora\nWybierz, co chcesz sprawdzić:'
+      },
+      action: {
+        button: '📋 Otwórz menu',
+        sections: [
+          {
+            title: 'Twoje narzędzia',
+            rows: [
+              {
+                id: 'instr_today',
+                title: '📅 Zajęcia na dziś',
+                description: 'Plan Twoich grup na dzisiaj'
+              },
+              {
+                id: 'instr_tomorrow',
+                title: '📆 Zajęcia na jutro',
+                description: 'Plan Twoich grup na jutro'
+              },
+              {
+                id: 'instr_absences_7d',
+                title: '📝 Nieobecności 7 dni',
+                description: 'Kto odwoływał zajęcia'
+              },
+              {
+                id: 'instr_add_slot',
+                title: '➕ Dodaj wolne miejsce',
+                description: 'Otwórz dodatkowy slot'
+              },
+              {
+                id: 'instr_stats_7d',
+                title: '📊 Statystyki 7 dni',
+                description: 'Frekwencja i odrabiania'
+              },
+              {
+                id: 'instr_end',
+                title: '🏁 Zakończ',
+                description: 'Zakończ rozmowę'
+              }
+            ]
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog = 'INSTR_MENU: [today] [tomorrow] [absences_7d] [add_slot] [stats_7d] [end]';
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId: null,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_list',
+    status,
+    reason,
+    waMessageId
+  });
+}
+
 // =========================
 // LISTA ZAJĘĆ UŻYTKOWNIKA (14 dni) + MENU ABSENCJI
 // =========================
@@ -1423,7 +1508,12 @@ app.post('/webhook', async (req, res) => {
 
           // 1) Najpierw obsługa odpowiedzi interaktywnych (menu + Tak/Nie)
           if (m.type === 'interactive') {
-            handled = await handleMainMenuInteractive({ client, m, sender });
+            // najpierw panel instruktora (jeśli dotyczy)
+            handled = await handleInstructorInteractive({ client, m, sender });
+
+            if (!handled) {
+              handled = await handleMainMenuInteractive({ client, m, sender });
+            }
             if (!handled) {
               handled = await handleMakeupInteractive({ client, m, sender });
             }
@@ -1441,7 +1531,7 @@ app.post('/webhook', async (req, res) => {
               });
               handled = true;
             } else if (sender.type === 'instructor') {
-              // brak akcji
+              await sendInstructorMenu({ to: m.from, instructorId: sender.id });
               handled = true;
             } else if (sender.type === 'user' && !sender.active) {
               await sendText({
@@ -1657,6 +1747,475 @@ async function sendAbsenceReminderTemplate() {
   } finally {
     client.release();
   }
+}
+
+async function sendInstructorClassesForDay({ client, to, instructorId, dayOffset }) {
+  const toNorm = normalizeTo(to);
+
+  const { rows } = await client.query(
+    `
+    WITH target_day AS (
+      SELECT (current_date + $2::int) AS d
+    ),
+    base AS (
+      SELECT
+        td.d                  AS session_date,
+        ct.id                 AS class_template_id,
+        ct.start_time,
+        ct.end_time,
+        g.name                AS group_name,
+        g.max_capacity
+      FROM target_day td
+      JOIN public.class_templates ct
+        ON ct.is_active = true
+       AND EXTRACT(ISODOW FROM td.d) = ct.weekday_iso
+      JOIN public.groups g
+        ON g.id = ct.group_id
+       AND g.is_active = true
+       AND g.instructor_id = $1
+    ),
+    enr AS (
+      SELECT
+        e.class_template_id,
+        COUNT(*) AS enrolled_count
+      FROM public.enrollments e
+      GROUP BY e.class_template_id
+    ),
+    os_open AS (
+      SELECT
+        s.class_template_id,
+        s.session_date,
+        COUNT(*) AS open_slots
+      FROM public.slots s
+      WHERE s.status = 'open'
+      GROUP BY s.class_template_id, s.session_date
+    )
+    SELECT
+      b.session_date,
+      b.start_time,
+      b.end_time,
+      b.group_name,
+      b.max_capacity,
+      COALESCE(e.enrolled_count, 0) AS enrolled_count,
+      COALESCE(o.open_slots, 0)     AS open_slots
+    FROM base b
+    LEFT JOIN enr e
+      ON e.class_template_id = b.class_template_id
+    LEFT JOIN os_open o
+      ON o.class_template_id = b.class_template_id
+     AND o.session_date = b.session_date
+    ORDER BY b.start_time, b.group_name
+    `,
+    [instructorId, dayOffset]
+  );
+
+  if (!rows.length) {
+    const label = dayOffset === 0 ? 'dzisiaj' : 'jutro';
+    await sendText({
+      to: toNorm,
+      body: `Nie masz przypisanych zajęć na ${label}.`
+    });
+    return;
+  }
+
+  const label = dayOffset === 0 ? 'dzisiaj' : 'jutro';
+  const lines = rows.map(r => {
+    const timeFrom = r.start_time.toString().slice(0,5);
+    const timeTo = r.end_time.toString().slice(0,5);
+    return `• ${timeFrom}-${timeTo} ${r.group_name} (${r.enrolled_count}/${r.max_capacity}, wolne: ${r.open_slots})`;
+  });
+
+  await sendText({
+    to: toNorm,
+    body: `Twoje zajęcia na ${label}:\n` + lines.join('\n')
+  });
+}
+
+async function sendInstructorAbsences7d({ client, to, instructorId }) {
+  const toNorm = normalizeTo(to);
+
+  const { rows } = await client.query(
+    `
+    SELECT
+      a.session_date,
+      ct.start_time,
+      g.name        AS group_name,
+      u.first_name,
+      u.last_name
+    FROM public.absences a
+    JOIN public.class_templates ct
+      ON ct.id = a.class_template_id
+    JOIN public.groups g
+      ON g.id = ct.group_id
+     AND g.instructor_id = $1
+    JOIN public.users u
+      ON u.id = a.user_id
+    WHERE a.session_date >= current_date - interval '7 days'
+    ORDER BY a.session_date DESC, ct.start_time, g.name, u.first_name, u.last_name
+    `,
+    [instructorId]
+  );
+
+  if (!rows.length) {
+    await sendText({
+      to: toNorm,
+      body: 'W ostatnich 7 dniach nie było zgłoszonych nieobecności w Twoich grupach.'
+    });
+    return;
+  }
+
+  const lines = rows.map(r => {
+    const d = r.session_date.toISOString().slice(0,10);
+    const [y,m,dd] = d.split('-');
+    const time = r.start_time.toString().slice(0,5);
+    return `• ${dd}/${m} ${time} ${r.group_name}: ${r.first_name} ${r.last_name}`;
+  });
+
+  await sendText({
+    to: toNorm,
+    body: 'Nieobecności w Twoich grupach (ostatnie 7 dni):\n' + lines.join('\n')
+  });
+}
+
+async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
+  const toNorm = normalizeTo(to);
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: null,
+      to: toNorm,
+      body: 'INSTR_ADD_SLOT_MENU (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_list',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return;
+  }
+
+  const { rows } = await client.query(
+    `
+    WITH days AS (
+      SELECT generate_series(current_date, current_date + interval '6 days', interval '1 day')::date AS d
+    )
+    SELECT
+      d.d                   AS session_date,
+      ct.id                 AS class_template_id,
+      ct.start_time,
+      g.name                AS group_name
+    FROM days d
+    JOIN public.class_templates ct
+      ON ct.is_active = true
+     AND EXTRACT(ISODOW FROM d.d) = ct.weekday_iso
+    JOIN public.groups g
+      ON g.id = ct.group_id
+     AND g.is_active = true
+     AND g.instructor_id = $1
+    ORDER BY d.d, ct.start_time, g.name
+    LIMIT 10
+    `,
+    [instructorId]
+  );
+
+  if (!rows.length) {
+    await sendText({
+      to: toNorm,
+      body: 'Brak Twoich zajęć w najbliższych 7 dniach – nie mogę dodać wolnego miejsca.'
+    });
+    return;
+  }
+
+  const listRows = rows.map(r => {
+    const iso = r.session_date.toISOString().slice(0,10); // YYYY-MM-DD
+    const [y,m,d] = iso.split('-');
+    const dateLabel = `${d}/${m}`;
+    const timeLabel = r.start_time.toString().slice(0,5);
+    let title = `${dateLabel} ${timeLabel}`;
+    if (title.length > 24) title = title.slice(0,24);
+    return {
+      id: `instr_addslot_${iso}_${r.class_template_id}`,
+      title,
+      description: r.group_name.substring(0,80)
+    };
+  });
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: {
+        text: 'Wybierz zajęcia, dla których chcesz dodać jedno dodatkowe wolne miejsce:'
+      },
+      action: {
+        button: '➕ Wybierz termin',
+        sections: [
+          {
+            title: 'Najbliższe zajęcia',
+            rows: listRows
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+  const bodyLog = 'INSTR_ADD_SLOT_MENU: ' + listRows.map(r => r.title).join(' | ');
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId: null,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_list',
+    status,
+    reason,
+    waMessageId
+  });
+}
+
+async function handleInstructorAddSlotSelection({ client, m, sender }) {
+  const to = m.from;
+  const toNorm = normalizeTo(to);
+
+  const reply = m.interactive?.list_reply;
+  const id = reply?.id || '';
+  if (!id.startsWith('instr_addslot_')) return false;
+
+  const parts = id.split('_'); // instr_addslot_YYYY-MM-DD_classTemplateId
+  if (parts.length !== 4) {
+    await sendText({
+      to: toNorm,
+      body: 'Nie udało się rozpoznać terminu. Spróbuj ponownie.'
+    });
+    return true;
+  }
+
+  const ymd = parts[2];
+  const classTemplateId = parseInt(parts[3], 10);
+  if (!classTemplateId || Number.isNaN(classTemplateId)) {
+    await sendText({
+      to: toNorm,
+      body: 'Nie udało się rozpoznać terminu. Spróbuj ponownie.'
+    });
+    return true;
+  }
+
+  // sprawdź, czy ten class_template należy do instruktora i nie przekroczymy pojemności
+  const { rows } = await client.query(
+    `
+    WITH grp AS (
+      SELECT
+        g.id            AS group_id,
+        g.max_capacity,
+        g.instructor_id
+      FROM public.class_templates ct
+      JOIN public.groups g ON g.id = ct.group_id
+      WHERE ct.id = $2
+      LIMIT 1
+    ),
+    enrolled AS (
+      SELECT COUNT(*) AS enrolled_count
+      FROM public.enrollments e
+      WHERE e.class_template_id = $2
+    ),
+    used AS (
+      SELECT
+        SUM(CASE WHEN s.status = 'open'  THEN 1 ELSE 0 END) AS open_cnt,
+        SUM(CASE WHEN s.status = 'taken' THEN 1 ELSE 0 END) AS taken_cnt
+      FROM public.slots s
+      WHERE s.class_template_id = $2
+        AND s.session_date = $3::date
+    )
+    SELECT
+      grp.max_capacity,
+      grp.instructor_id,
+      COALESCE(enrolled.enrolled_count,0) AS enrolled_count,
+      COALESCE(used.open_cnt,0)          AS open_cnt,
+      COALESCE(used.taken_cnt,0)         AS taken_cnt
+    FROM grp
+    LEFT JOIN enrolled ON true
+    LEFT JOIN used     ON true
+    `,
+    [sender.id, classTemplateId, ymd]
+  );
+
+  const row = rows[0];
+
+  if (!row || row.instructor_id !== sender.id) {
+    await sendText({
+      to: toNorm,
+      body: 'Nie możesz dodać miejsca do tych zajęć.'
+    });
+    return true;
+  }
+
+  const usedTotal = row.enrolled_count + row.open_cnt + row.taken_cnt;
+  if (usedTotal >= row.max_capacity) {
+    await sendText({
+      to: toNorm,
+      body: 'Nie można dodać kolejnego miejsca – osiągnięto maksymalną pojemność grupy.'
+    });
+    return true;
+  }
+
+  await client.query(
+    `
+    INSERT INTO public.slots (
+      class_template_id,
+      session_date,
+      source_absence_id,
+      status,
+      taken_by_user_id,
+      taken_at,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2::date, NULL, 'open', NULL, NULL, now(), now())
+    `,
+    [classTemplateId, ymd]
+  );
+
+  const [Y,M,D] = ymd.split('-');
+  await sendText({
+    to: toNorm,
+    body: `Dodano jedno wolne miejsce na zajęcia ${D}/${M}.`
+  });
+
+  return true;
+}
+
+async function sendInstructorStats7d({ client, to, instructorId }) {
+  const toNorm = normalizeTo(to);
+
+  const { rows } = await client.query(
+    `
+    WITH days AS (
+      SELECT generate_series(current_date - interval '6 days', current_date, interval '1 day')::date AS d
+    ),
+    classes AS (
+      SELECT DISTINCT
+        d.d               AS session_date,
+        ct.id             AS class_template_id
+      FROM days d
+      JOIN public.class_templates ct
+        ON ct.is_active = true
+       AND EXTRACT(ISODOW FROM d.d) = ct.weekday_iso
+      JOIN public.groups g
+        ON g.id = ct.group_id
+       AND g.is_active = true
+       AND g.instructor_id = $1
+    ),
+    abs AS (
+      SELECT COUNT(*) AS total_absences
+      FROM public.absences a
+      JOIN classes c
+        ON c.class_template_id = a.class_template_id
+       AND c.session_date = a.session_date
+    ),
+    open_slots AS (
+      SELECT COUNT(*) AS total_open_slots
+      FROM public.slots s
+      JOIN classes c
+        ON c.class_template_id = s.class_template_id
+       AND c.session_date = s.session_date
+      WHERE s.status = 'open'
+    ),
+    taken_slots AS (
+      SELECT COUNT(*) AS total_makeups
+      FROM public.slots s
+      JOIN classes c
+        ON c.class_template_id = s.class_template_id
+       AND c.session_date = s.session_date
+      WHERE s.status = 'taken'
+    )
+    SELECT
+      (SELECT COUNT(*) FROM classes)                      AS total_classes,
+      COALESCE((SELECT total_absences  FROM abs),0)       AS total_absences,
+      COALESCE((SELECT total_open_slots FROM open_slots),0) AS total_open_slots,
+      COALESCE((SELECT total_makeups   FROM taken_slots),0) AS total_makeups
+    `,
+    [instructorId]
+  );
+
+  const s = rows[0] || {
+    total_classes: 0,
+    total_absences: 0,
+    total_open_slots: 0,
+    total_makeups: 0
+  };
+
+  await sendText({
+    to: toNorm,
+    body:
+      'Ostatnie 7 dni (Twoje grupy):\n' +
+      `• Zajęcia: ${s.total_classes}\n` +
+      `• Zgłoszone nieobecności: ${s.total_absences}\n` +
+      `• Udostępnione wolne miejsca: ${s.total_open_slots}\n` +
+      `• Zajęte miejsca do odrabiania: ${s.total_makeups}`
+  });
+}
+
+async function handleInstructorInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'instructor' || !sender.active) return false;
+  if (m.type !== 'interactive') return false;
+
+  const itype = m.interactive?.type || '';
+
+  // wybory z listy głównej
+  if (itype === 'list_reply') {
+    const id = m.interactive.list_reply?.id || '';
+
+    if (id === 'instr_today') {
+      await sendInstructorClassesForDay({ client, to: m.from, instructorId: sender.id, dayOffset: 0 });
+      return true;
+    }
+
+    if (id === 'instr_tomorrow') {
+      await sendInstructorClassesForDay({ client, to: m.from, instructorId: sender.id, dayOffset: 1 });
+      return true;
+    }
+
+    if (id === 'instr_absences_7d') {
+      await sendInstructorAbsences7d({ client, to: m.from, instructorId: sender.id });
+      return true;
+    }
+
+    if (id === 'instr_add_slot') {
+      await sendInstructorAddSlotMenu({ client, to: m.from, instructorId: sender.id });
+      return true;
+    }
+
+    if (id === 'instr_stats_7d') {
+      await sendInstructorStats7d({ client, to: m.from, instructorId: sender.id });
+      return true;
+    }
+
+    if (id === 'instr_end') {
+      await sendText({
+        to: m.from,
+        body: 'Dziękujemy. Panel instruktora zamknięty.'
+      });
+      return true;
+    }
+
+    // wybór konkretnego terminu do dodania slota
+    if (id.startsWith('instr_addslot_')) {
+      return await handleInstructorAddSlotSelection({ client, m, sender });
+    }
+
+    return false;
+  }
+
+  // na wszelki wypadek obsłuż także list_reply z add_slot w tym samym miejscu
+  if (itype === 'button_reply') {
+    // na razie brak przycisków w menu instruktora
+    return false;
+  }
+
+  return false;
 }
 
 
