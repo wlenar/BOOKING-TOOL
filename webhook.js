@@ -357,7 +357,7 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
         text: 'Wybierz termin zajęć, dla których chcesz zgłosić nieobecność, lub wybierz "Inny termin".'
       },
       action: {
-        button: 'Wybierz termin',
+        button: '🗓️Wybierz termin',
         sections: [
           {
             title: 'Twoje zajęcia',
@@ -432,17 +432,17 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
     interactive: {
       type: 'button',
       body: {
-        text: 'Czy chcesz zgłosić kolejną nieobecność?'
+        text: 'Czy chcesz zgłosić kolejną nieobecność 📅 czy wrócić do menu głównego 🏠?'
       },
       action: {
         buttons: [
           {
             type: 'reply',
-            reply: { id: 'absence_more_yes', title: '✅ Tak' }
+            reply: { id: 'absence_more_yes', title: '➕ Kolejna nieobecność' }
           },
           {
             type: 'reply',
-            reply: { id: 'absence_more_no', title: '❌ Nie' }
+            reply: { id: 'absence_more_no', title: '🏠 Menu głównee' }
           }
         ]
       }
@@ -604,7 +604,7 @@ async function sendMakeupMenu({ client, to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: 'Wybierz termin z dostępnych wolnych miejsc do odrabiania.'
+        text: '✨ Wolne miejsca do odrabiania w tym tygodniu:\n(wybierz termin, aby zarezerwować)'
       },
       action: {
         button: 'Wybierz termin',
@@ -859,7 +859,7 @@ async function handleAbsenceInteractive({ client, m, sender }) {
     if (result.ok) {
       await sendText({
         to: m.from,
-        body: `✔️ Nieobecność ${ymd} została zgłoszona, miejsce zwolnione.`,
+        body: `✅ Zgłoszono Twoją nieobecność ${ymd}. Miejsce zostało zwolnione.`,
         userId: sender.id
       });
       await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
