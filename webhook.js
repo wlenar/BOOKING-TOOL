@@ -389,24 +389,48 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
 async function sendMakeupMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
 
-  // dynamicznie z bazy, bez slot_offers / job_prepare_weekly_slot_offers
+  // 1) Dane usera + kredyty
+  const userRes = await client.query(
+    `
+    SELECT
+      u.id AS user_id,
+      u.is_active,
+      u.level_id,
+      COALESCE(c.balance, 0) AS credits,
+      COALESCE(uhp.max_home_price, 999999::numeric) AS max_home_price
+    FROM public.users u
+    LEFT JOIN public.user_absence_credits c
+      ON c.user_id = u.id
+    LEFT JOIN public.v_user_home_price uhp
+      ON uhp.user_id = u.id
+    WHERE u.id = $1
+    `,
+    [userId]
+  );
+
+  const u = userRes.rows[0];
+
+  if (!u || !u.is_active) {
+    return sendText({
+      to: toNorm,
+      userId,
+      body: 'Twój numer nie jest aktywny w systemie. Skontaktuj się proszę ze studiem.'
+    });
+  }
+
+  // brak kredytów -> dedykowany komunikat
+  if ((u.credits || 0) <= 0) {
+    return sendText({
+      to: toNorm,
+      userId,
+      body: 'Nie masz obecnie nieobecności do odrobienia.'
+    });
+  }
+
+  // 2) Szukamy dostępnych terminów (już bez sprawdzania credits w SQL)
   const { rows } = await client.query(
     `
-    WITH u AS (
-      SELECT
-        u.id AS user_id,
-        u.level_id,
-        COALESCE(c.balance, 0) AS credits,
-        COALESCE(uhp.max_home_price, 999999::numeric) AS max_home_price
-      FROM public.users u
-      LEFT JOIN public.user_absence_credits c
-        ON c.user_id = u.id
-      LEFT JOIN public.v_user_home_price uhp
-        ON uhp.user_id = u.id
-      WHERE u.id = $1
-        AND u.is_active = true
-    ),
-    candidate_slots AS (
+    WITH candidate_slots AS (
       SELECT
         os.session_date,
         os.session_date_ymd,
@@ -415,17 +439,15 @@ async function sendMakeupMenu({ client, to, userId }) {
         os.group_name,
         COUNT(*) AS open_slots
       FROM public.v_open_slots_desc os
-      CROSS JOIN u
       LEFT JOIN public.enrollments e
-        ON e.user_id = u.user_id
+        ON e.user_id = $1
        AND e.class_template_id = os.class_template_id
       WHERE
-            u.credits > 0
-        AND os.session_date >= current_date
+            os.session_date >= current_date
         AND os.session_date <  current_date + interval '7 days'
         AND os.free_capacity_remaining > 0
-        AND (os.required_level IS NULL OR os.required_level <= u.level_id)
-        AND (os.price_per_session IS NULL OR os.price_per_session <= u.max_home_price)
+        AND (os.required_level IS NULL OR os.required_level <= $2)
+        AND (os.price_per_session IS NULL OR os.price_per_session <= $3)
         AND e.user_id IS NULL
       GROUP BY
         os.session_date,
@@ -440,14 +462,14 @@ async function sendMakeupMenu({ client, to, userId }) {
     ORDER BY session_date, session_time, group_name
     LIMIT 10
     `,
-    [userId]
+    [userId, u.level_id, u.max_home_price]
   );
 
   if (!rows || rows.length === 0) {
     return sendText({
       to: toNorm,
-      body: 'Aktualnie nie ma dostępnych wolnych miejsc do odrabiania w najbliższym tygodniu.',
-      userId
+      userId,
+      body: 'Aktualnie nie ma dostępnych wolnych miejsc do odrabiania w najbliższym tygodniu.'
     });
   }
 
@@ -464,7 +486,7 @@ async function sendMakeupMenu({ client, to, userId }) {
   }
 
   const listRows = rows.map((r) => {
-    const iso = String(r.session_date_ymd || '').slice(0, 10); // 'YYYY-MM-DD'
+    const iso = String(r.session_date_ymd || '').slice(0, 10); // YYYY-MM-DD
     const [y, m, d] = iso.split('-');
     const dateLabel = `${d}/${m}`;
     const timeLabel = (r.session_time || '').toString().slice(0, 5);
@@ -477,7 +499,7 @@ async function sendMakeupMenu({ client, to, userId }) {
     const desc = r.group_name || '';
 
     return {
-      id: `makeup_${iso}_${r.class_template_id}`, // 1 wiersz = 1 termin
+      id: `makeup_${iso}_${r.class_template_id}`,
       title,
       ...(desc ? { description: desc.substring(0, 80) } : {})
     };
@@ -525,83 +547,6 @@ async function sendMakeupMenu({ client, to, userId }) {
 
   return res;
 }
-
-async function sendMainMenu({ to, userId }) {
-  const toNorm = normalizeTo(to);
-
-  if (!WA_TOKEN || !WA_PHONE_ID) {
-    const body =
-      'MENU GŁÓWNE:\n' +
-      '1. Zgłoszenie nieobecności\n' +
-      '2. Odrabianie zajęć\n' +
-      '3. Ilość nieobecności\n' +
-      '4. Zakończ rozmowę';
-    await auditOutbound({
-      userId,
-      to: toNorm,
-      body,
-      messageType: 'text',
-      status: 'skipped',
-      reason: 'missing_config'
-    });
-    return;
-  }
-
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: toNorm,
-    type: 'interactive',
-    interactive: {
-      type: 'list',
-      body: {
-        text:
-          'Wybierz jedną z opcji:\n' +
-          '1. Zgłoszenie nieobecności\n' +
-          '2. Odrabianie zajęć\n' +
-          '3. Ilość nieobecności\n' +
-          '4. Zakończ rozmowę'
-      },
-      action: {
-        button: 'Menu główne',
-        sections: [
-          {
-            title: 'Menu główne',
-            rows: [
-              { id: 'menu_absence', title: 'Zgłoszenie nieobecności' },
-              { id: 'menu_makeup', title: 'Odrabianie zajęć' },
-              { id: 'menu_credits', title: 'Ilość nieobecności' },
-              { id: 'menu_end', title: 'Zakończ rozmowę' }
-            ]
-          }
-        ]
-      }
-    }
-  };
-
-  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
-
-  const bodyLog =
-    'MENU_GLOWNE: 1-Zgłoszenie nieobecności | 2-Odrabianie zajęć | 3-Ilość nieobecności | 4-Zakończ rozmowę';
-
-  const waMessageId = res.data?.messages?.[0]?.id || null;
-  const status = res.ok ? 'sent' : 'error';
-  const reason = res.ok
-    ? null
-    : (res.status ? `http_${res.status}` : 'send_failed');
-
-  await auditOutbound({
-    userId,
-    to: toNorm,
-    body: bodyLog,
-    messageType: 'interactive_list',
-    status,
-    reason,
-    waMessageId
-  });
-
-  return res;
-}
-
 async function runWeeklySlotsJob() {
   const client = await pool.connect();
   try {
