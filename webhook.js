@@ -233,14 +233,7 @@ async function sendMainMenu({ to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text:
-          '🍂 Witaj w studiu Pilates!\n' +
-          'Co chcesz dziś zrobić?\n\n' +
-          '1️⃣ Zgłoszenie nieobecności\n' +
-          '2️⃣ Odrabianie zajęć\n' +
-          '3️⃣ Ilość nieobecności\n' +
-          '4️⃣ Zakończ rozmowę\n\n' +
-          'Wybierz z listy lub wpisz numer 👇'
+        text: '🍂 Witaj w studiu Pilates!\n\nWybierz, co chcesz zrobić 👇'
       },
       action: {
         button: '📋 Otwórz menu',
@@ -250,23 +243,23 @@ async function sendMainMenu({ to, userId }) {
             rows: [
               {
                 id: 'menu_absence',
-                title: 'Zgłoś nieobecność',
-                description: 'Wybierz termin z listy swoich zajęć'
+                title: '📅 Zgłoś nieobecność',
+                description: 'Zwolnij miejsce na zajęcia'
               },
               {
                 id: 'menu_makeup',
-                title: 'Odrabianie zajęć',
-                description: 'Wybierz wolny termin do odrabiania'
+                title: '🎯 Odrób zajęcia',
+                description: 'Zarezerwuj wolny termin'
               },
               {
                 id: 'menu_credits',
-                title: 'Ile mam nieobecności?',
-                description: 'Sprawdź liczbę do odrobienia'
+                title: '🔢 Moje nieobecności',
+                description: 'Sprawdź ile masz do odrobienia'
               },
               {
                 id: 'menu_end',
-                title: 'Zakończ rozmowę',
-                description: 'Zakończ bez wprowadzania zmian'
+                title: '🏁 Zakończ rozmowę',
+                description: 'Zamknij czat bez zmian'
               }
             ]
           }
@@ -278,7 +271,7 @@ async function sendMainMenu({ to, userId }) {
   const res = await postWA({ phoneId: WA_PHONE_ID, payload });
 
   const bodyLog =
-    'MENU_GLOWNE: [Zgłoś nieobecność] [Odrabianie zajęć] [Ile mam nieobecności?] [Zakończ rozmowę]';
+    'MENU_GLOWNE: [Zgłoś nieobecność] [Odrób zajęcia] [Moje nieobecności] [Zakończ rozmowę]';
 
   if (res.ok) {
     const waMessageId = res.data?.messages?.[0]?.id || null;
@@ -333,7 +326,7 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
       const rawDate = row.session_date;
       const iso = rawDate instanceof Date
         ? rawDate.toISOString().slice(0, 10)
-        : String(rawDate).slice(0, 10);
+        : String(rawDate).slice(0, 10); // YYYY-MM-DD
 
       const [y, m, d] = iso.split('-');
       const yy = y.slice(2, 4);
@@ -368,7 +361,7 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
             rows: [
               {
                 id: 'absence_other_date',
-                title: 'Inny termin',
+                title: '📆 Inny termin',
                 description: 'Podam datę w wiadomości'
               }
             ]
@@ -432,17 +425,17 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
     interactive: {
       type: 'button',
       body: {
-        text: 'Czy chcesz zgłosić kolejną nieobecność 📅 czy wrócić do menu głównego 🏠?'
+        text: 'Czy chcesz zgłosić kolejną nieobecność?'
       },
       action: {
         buttons: [
           {
             type: 'reply',
-            reply: { id: 'absence_more_yes', title: '➕ Kolejna nieobecność' }
+            reply: { id: 'absence_more_yes', title: '➕ Tak, kolejną' }
           },
           {
             type: 'reply',
-            reply: { id: 'absence_more_no', title: '🏠 Menu głównee' }
+            reply: { id: 'absence_more_no', title: '🏠 Menu główne' }
           }
         ]
       }
@@ -451,29 +444,23 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
 
   const res = await postWA({ phoneId: WA_PHONE_ID, payload });
 
-  const bodyLog = 'ABSENCE_MORE: [Tak] [Nie]';
+  const bodyLog = 'ABSENCE_MORE: [Tak, kolejną] [Menu główne]';
 
-  if (res.ok) {
-    const waMessageId = res.data?.messages?.[0]?.id || null;
-    await auditOutbound({
-      userId,
-      to: toNorm,
-      body: bodyLog,
-      messageType: 'interactive_buttons',
-      status: 'sent',
-      waMessageId
-    });
-  } else {
-    const reason = res.status ? `http_${res.status}` : 'send_failed';
-    await auditOutbound({
-      userId,
-      to: toNorm,
-      body: bodyLog,
-      messageType: 'interactive_buttons',
-      status: 'error',
-      reason
-    });
-  }
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok
+    ? null
+    : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_buttons',
+    status,
+    reason,
+    waMessageId
+  });
 
   return res;
 }
@@ -481,7 +468,6 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
 async function sendMakeupMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
 
-  // 1) Dane usera + kredyty
   const userRes = await client.query(
     `
     SELECT
@@ -510,7 +496,6 @@ async function sendMakeupMenu({ client, to, userId }) {
     });
   }
 
-  // brak kredytów -> dedykowany komunikat
   if ((u.credits || 0) <= 0) {
     return sendText({
       to: toNorm,
@@ -519,7 +504,6 @@ async function sendMakeupMenu({ client, to, userId }) {
     });
   }
 
-  // 2) Szukamy dostępnych terminów (już bez sprawdzania credits w SQL)
   const { rows } = await client.query(
     `
     WITH candidate_slots AS (
@@ -578,7 +562,7 @@ async function sendMakeupMenu({ client, to, userId }) {
   }
 
   const listRows = rows.map((r) => {
-    const iso = String(r.session_date_ymd || '').slice(0, 10); // YYYY-MM-DD
+    const iso = String(r.session_date_ymd || '').slice(0, 10);
     const [y, m, d] = iso.split('-');
     const dateLabel = `${d}/${m}`;
     const timeLabel = (r.session_time || '').toString().slice(0, 5);
@@ -604,10 +588,10 @@ async function sendMakeupMenu({ client, to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: '✨ Wolne miejsca do odrabiania w tym tygodniu:\n(wybierz termin, aby zarezerwować)'
+        text: '✨ Wybierz termin, który chcesz zarezerwować:'
       },
       action: {
-        button: 'Wybierz termin',
+        button: '🎯 Zarezerwuj',
         sections: [
           {
             title: 'Dostępne miejsca',
@@ -639,6 +623,7 @@ async function sendMakeupMenu({ client, to, userId }) {
 
   return res;
 }
+
 async function runWeeklySlotsJob() {
   const client = await pool.connect();
   try {
@@ -680,13 +665,15 @@ async function runWeeklySlotsBroadcast() {
           END
         ) AS phone,
         os.slot_id,
-        to_char(os.session_date, 'DD.MM')   AS session_date_label,
-        to_char(os.session_time, 'HH24:MI') AS session_time_label,
+        os.class_template_id,
+        to_char(os.session_date, 'YYYY-MM-DD') AS session_date_ymd,
+        to_char(os.session_date, 'DD.MM')     AS session_date_label,
+        to_char(os.session_time, 'HH24:MI')   AS session_time_label,
         os.group_name
       FROM public.slot_offers so
       JOIN public.users u
         ON u.id = so.user_id
-       AND u.is_active = true
+        AND u.is_active = true
       JOIN public.v_open_slots_desc os
         ON os.slot_id = so.slot_id
       WHERE
@@ -740,7 +727,7 @@ async function runWeeklySlotsBroadcast() {
       if (!listOffers.length) continue;
 
       const rowsList = listOffers.map(o => ({
-        id: `makeup_${o.offer_id}`,
+        id: `makeup_${o.session_date_ymd}_${o.class_template_id}`,
         title: `${o.session_date_label} ${o.session_time_label}`.substring(0, 24),
         description: (o.group_name || '').substring(0, 80)
       }));
@@ -914,11 +901,7 @@ async function handleAbsenceInteractive({ client, m, sender }) {
     }
 
     if (replyId === 'absence_more_no') {
-      await sendText({
-        to: m.from,
-        body: 'Dziękujemy, nieobecności zostały zapisane.',
-        userId: sender.id
-      });
+      await sendMainMenu({ to: m.from, userId: sender.id });
       return true;
     }
   }
@@ -1093,9 +1076,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
 
   const itype = m.interactive?.type;
 
-  // -------------------------
-  // 1) Lista (MENU GŁÓWNE)
-  // -------------------------
+  // 1) Odpowiedzi z listy (menu główne)
   if (itype === 'list_reply') {
     const id = m.interactive.list_reply?.id || '';
 
@@ -1122,7 +1103,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
         userId: sender.id
       });
 
-      // follow-up: zapytanie, czy wrócić do menu czy zakończyć
+      // follow-up: przyciski "wolne terminy" / "menu główne"
       if (WA_TOKEN && WA_PHONE_ID) {
         const toNorm = normalizeTo(m.from);
         const payload = {
@@ -1132,17 +1113,17 @@ async function handleMainMenuInteractive({ client, m, sender }) {
           interactive: {
             type: 'button',
             body: {
-              text: 'Czy chcesz wrócić do menu głównego czy zakończyć rozmowę?'
+              text: 'Co chcesz zrobić dalej?'
             },
             action: {
               buttons: [
                 {
                   type: 'reply',
-                  reply: { id: 'credits_menu', title: '⬅️ Menu główne' }
+                  reply: { id: 'credits_makeup', title: '🎯 Zobacz wolne terminy' }
                 },
                 {
                   type: 'reply',
-                  reply: { id: 'credits_end', title: 'Zakończ rozmowę' }
+                  reply: { id: 'credits_menu', title: '🏠 Menu główne' }
                 }
               ]
             }
@@ -1150,8 +1131,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
         };
 
         const res = await postWA({ phoneId: WA_PHONE_ID, payload });
-        const bodyLog = 'CREDITS_FOLLOWUP: [Menu główne] [Zakończ rozmowę]';
-
+        const bodyLog = 'CREDITS_FOLLOWUP: [Zobacz wolne terminy] [Menu główne]';
         const waMessageId = res.data?.messages?.[0]?.id || null;
         const status = res.ok ? 'sent' : 'error';
         const reason = res.ok
@@ -1175,7 +1155,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     if (id === 'menu_end') {
       await sendText({
         to: m.from,
-        body: 'Dziękujemy za kontakt. Do zobaczenia na zajęciach!',
+        body: '💛 Dziękujemy! Do zobaczenia na macie!',
         userId: sender.id
       });
       return true;
@@ -1184,23 +1164,17 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     return false;
   }
 
-  // -------------------------
-  // 2) Przyciski po "Ilość nieobecności"
-  // -------------------------
+  // 2) Przyciski po "Moje nieobecności"
   if (itype === 'button_reply') {
     const replyId = m.interactive.button_reply?.id || '';
 
-    if (replyId === 'credits_menu') {
-      await sendMainMenu({ to: m.from, userId: sender.id });
+    if (replyId === 'credits_makeup') {
+      await sendMakeupMenu({ client, to: m.from, userId: sender.id });
       return true;
     }
 
-    if (replyId === 'credits_end') {
-      await sendText({
-        to: m.from,
-        body: 'Dziękujemy za kontakt. Do zobaczenia na zajęciach!',
-        userId: sender.id
-      });
+    if (replyId === 'credits_menu') {
+      await sendMainMenu({ to: m.from, userId: sender.id });
       return true;
     }
 
@@ -1593,6 +1567,98 @@ app.post('/webhook', async (req, res) => {
   }
   res.sendStatus(200);
 });
+
+async function sendAbsenceReminderTemplate() {
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    console.log('[CRON] absence_reminder skipped (missing WA config)');
+    return;
+  }
+
+  const client = await pool.connect();
+
+  try {
+    console.log('[CRON] absence_reminder start');
+
+    const { rows } = await client.query(
+      `
+      SELECT
+        id AS user_id,
+        first_name,
+        COALESCE(
+          phone_e164,
+          CASE
+            WHEN phone_raw IS NOT NULL
+            THEN '+' || REGEXP_REPLACE(phone_raw, '^\\+?', '')
+            ELSE NULL
+          END
+        ) AS phone
+      FROM public.users
+      WHERE is_active = true
+        AND (
+          phone_e164 IS NOT NULL
+          OR phone_raw IS NOT NULL
+        )
+      `
+    );
+
+    if (!rows.length) {
+      console.log('[CRON] absence_reminder no active users with phone');
+      return;
+    }
+
+    for (const u of rows) {
+      const toNorm = normalizeTo(u.phone);
+      if (!toNorm) continue;
+
+      const firstName = (u.first_name || '').trim() || 'Klientko/Kliencie';
+
+      const payload = {
+        messaging_product: 'whatsapp',
+        to: toNorm,
+        type: 'template',
+        template: {
+          name: 'absence_reminder',
+          language: { code: 'pl' },
+          components: [
+            {
+              type: 'body',
+              parameters: [
+                { type: 'text', text: firstName }
+              ]
+            }
+          ]
+        }
+      };
+
+      const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+      const waMessageId = res.data?.messages?.[0]?.id || null;
+      const status = res.ok ? 'sent' : 'error';
+      const reason = res.ok
+        ? null
+        : (res.status ? `http_${res.status}` : 'send_failed');
+
+      await auditOutbound({
+        userId: u.user_id,
+        to: toNorm,
+        body: 'TEMPLATE: absence_reminder',
+        templateName: 'absence_reminder',
+        variables: JSON.stringify({ '{1}': firstName }),
+        messageType: 'template',
+        status,
+        reason,
+        waMessageId
+      });
+    }
+
+    console.log('[CRON] absence_reminder done, users:', rows.length);
+  } catch (err) {
+    console.error('[CRON] absence_reminder error', err);
+  } finally {
+    client.release();
+  }
+}
+
 
 // =========================
 // CRON JOBS
