@@ -174,25 +174,9 @@ async function resolveSenderType(client, wa) {
       LIMIT 1`,
     [waPlus, waBare]
   );
-  if (i.rowCount > 0) return { type: 'instructor', ...i.rows[0], active: true };
+  if (i.rowCount > 0) return { type: 'instructor', ...i.rows[0] };
 
   return { type: 'none' };
-}
-
-// =========================
-// Czy user ma zajęcia tego dnia? (enrollments -> class_templates.weekday_iso)
-// =========================
-async function userHasClassThatDay(client, userId, ymd) {
-  // ymd: 'YYYY-MM-DD'
-  const q = await client.query(`
-    SELECT 1
-    FROM public.enrollments e
-    JOIN public.class_templates ct ON ct.id = e.class_template_id
-    WHERE e.user_id = $1
-      AND ct.weekday_iso = EXTRACT(ISODOW FROM $2::date)::int
-    LIMIT 1
-  `, [userId, ymd]);
-  return q.rowCount > 0;
 }
 
 // =========================
@@ -405,12 +389,6 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
 async function sendMakeupMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
 
-  // odśwież oferty wg logiki z bazy
-  try {
-    await client.query('SELECT public.job_prepare_weekly_slot_offers();');
-  } catch (err) {
-    console.error('[makeup] job_prepare_weekly_slot_offers error', err);
-  }
 
   // pobierz dostępne oferty dla tego usera
   const q = await client.query(
@@ -622,10 +600,10 @@ async function runWeeklySlotsBroadcast() {
   try {
     console.log('[CRON] weekly_slots_broadcast start');
 
-    // 1) Przygotuj oferty w bazie (logika w SQL)
+    // 1) przygotuj oferty w bazie
     await client.query('SELECT public.job_prepare_weekly_slot_offers();');
 
-    // 2) Pobierz pending oferty + opis slotów
+    // 2) pending oferty
     const { rows } = await client.query(`
       SELECT
         so.id AS offer_id,
@@ -646,7 +624,7 @@ async function runWeeklySlotsBroadcast() {
       FROM public.slot_offers so
       JOIN public.users u
         ON u.id = so.user_id
-        AND u.is_active = true
+       AND u.is_active = true
       JOIN public.v_open_slots_desc os
         ON os.slot_id = so.slot_id
       WHERE
@@ -662,91 +640,48 @@ async function runWeeklySlotsBroadcast() {
       return;
     }
 
-    // 3) Grupowanie po użytkowniku
+    // 3) grupowanie po user_id
     const byUser = new Map();
     for (const r of rows) {
       if (!r.phone) continue;
-      let u = byUser.get(r.user_id);
-      if (!u) {
-        u = {
+      if (!byUser.has(r.user_id)) {
+        byUser.set(r.user_id, {
           userId: r.user_id,
           firstName: r.first_name || '',
           phone: r.phone,
           offers: []
-        };
-        byUser.set(r.user_id, u);
+        });
       }
-      u.offers.push(r);
+      byUser.get(r.user_id).offers.push(r);
     }
 
-    // 4) Wysyłka: template weekly_slots_update + lista interaktywna
+    // 4) wysyłka per użytkownik
     for (const u of byUser.values()) {
       const toNorm = normalizeTo(u.phone);
       if (!toNorm) continue;
 
-      const firstName = u.firstName || '';
+      const introBody =
+        '🌿 Dostępne miejsca do odrabiania w tym tygodniu:\n' +
+        u.offers
+          .slice(0, 10)
+          .map(o => `${o.session_date_label} ${o.session_time_label} ${o.group_name}`)
+          .join('\n') +
+        '\n\nWybierz termin z listy, aby go zarezerwować.';
 
-      // 4a) Template otwierający okno (weekly_slots_update)
-      const tplPayload = {
-        messaging_product: 'whatsapp',
+      await sendText({
         to: toNorm,
-        type: 'template',
-        template: {
-          name: 'weekly_slots_update',
-          language: { code: 'pl' },
-          components: [
-            {
-              type: 'body',
-              parameters: [
-                { type: 'text', text: firstName }
-              ]
-            }
-          ]
-        }
-      };
-
-      const tplRes = await postWA({ phoneId: WA_PHONE_ID, payload: tplPayload });
-      const tplWaMessageId = tplRes.data?.messages?.[0]?.id || null;
-      const tplStatus = tplRes.ok ? 'sent' : 'error';
-      const tplReason = tplRes.ok ? null : (tplRes.status ? `http_${tplRes.status}` : 'send_failed');
-
-      await auditOutbound({
-        userId: u.userId,
-        to: toNorm,
-        body: null,
-        messageType: 'template',
-        status: tplStatus,
-        reason: tplReason,
-        waMessageId: tplWaMessageId,
-        templateName: 'weekly_slots_update',
-        variables: JSON.stringify([firstName])
+        body: introBody,
+        userId: u.userId
       });
 
-      if (!tplRes.ok) {
-        // Oznacz oferty jako error (żeby nie mielić w kółko)
-        const errOfferIds = u.offers.map(o => o.offer_id);
-        await client.query(
-          `UPDATE public.slot_offers
-             SET status = 'error', updated_at = now()
-           WHERE id = ANY($1::bigint[])`,
-          [errOfferIds]
-        );
-        continue;
-      }
-
-      // 4b) Lista interaktywna (max 10 pozycji)
       const listOffers = u.offers.slice(0, 10);
       if (!listOffers.length) continue;
 
-      const rowsList = listOffers.map((o) => {
-        const title = `${o.session_date_label} ${o.session_time_label}`.substring(0, 24);
-        const desc = o.group_name || '';
-        return {
-          id: `makeup_${o.offer_id}`,
-          title,
-        description: desc ? desc.substring(0, 80) : undefined
-      };
-    });
+      const rowsList = listOffers.map(o => ({
+        id: `makeup_${o.offer_id}`,
+        title: `${o.session_date_label} ${o.session_time_label}`.substring(0, 24),
+        description: (o.group_name || '').substring(0, 80)
+      }));
 
       const listPayload = {
         messaging_product: 'whatsapp',
@@ -772,7 +707,9 @@ async function runWeeklySlotsBroadcast() {
       const listRes = await postWA({ phoneId: WA_PHONE_ID, payload: listPayload });
       const listWaMessageId = listRes.data?.messages?.[0]?.id || null;
       const listStatus = listRes.ok ? 'sent' : 'error';
-      const listReason = listRes.ok ? null : (listRes.status ? `http_${listRes.status}` : 'send_failed');
+      const listReason = listRes.ok
+        ? null
+        : (listRes.status ? `http_${listRes.status}` : 'send_failed');
 
       await auditOutbound({
         userId: u.userId,
@@ -784,100 +721,23 @@ async function runWeeklySlotsBroadcast() {
         waMessageId: listWaMessageId
       });
 
-      if (listRes.ok) {
-        const sentOfferIds = listOffers.map(o => o.offer_id);
-        await client.query(
-          `UPDATE public.slot_offers
-             SET status = 'sent', updated_at = now()
-           WHERE id = ANY($1::bigint[])`,
-          [sentOfferIds]
-        );
-      } else {
-        const errOfferIds = listOffers.map(o => o.offer_id);
-        await client.query(
-          `UPDATE public.slot_offers
-             SET status = 'error', updated_at = now()
-           WHERE id = ANY($1::bigint[])`,
-          [errOfferIds]
-        );
-      }
+      const offerIds = listOffers.map(o => o.offer_id);
+      const newStatus = listRes.ok ? 'sent' : 'error';
+
+      await client.query(
+        `
+        UPDATE public.slot_offers
+           SET status = $2,
+               updated_at = now()
+         WHERE id = ANY($1::bigint[])
+        `,
+        [offerIds, newStatus]
+      );
     }
 
     console.log('[CRON] weekly_slots_broadcast done, users:', byUser.size);
   } catch (err) {
     console.error('[CRON] weekly_slots_broadcast error', err);
-  } finally {
-    client.release();
-  }
-}
-
-async function sendAbsenceReminderTemplate() {
-  if (!WA_TOKEN || !WA_PHONE_ID) {
-    console.log('[CRON] absence_reminder skipped (missing WA config)');
-    return;
-  }
-
-  const client = await pool.connect();
-  try {
-    console.log('[CRON] absence_reminder start');
-
-    const { rows } = await client.query(`
-      SELECT id, first_name, phone_e164, phone_raw
-      FROM public.users
-      WHERE is_active = true
-        AND (phone_e164 IS NOT NULL OR phone_raw IS NOT NULL)
-    `);
-
-    for (const row of rows) {
-      const raw =
-        row.phone_e164 ||
-        (row.phone_raw ? ('+' + String(row.phone_raw).replace(/^\+?/, '')) : null);
-
-      if (!raw) continue;
-
-      const toNorm = normalizeTo(raw);
-
-      const payload = {
-        messaging_product: 'whatsapp',
-        to: toNorm,
-        type: 'template',
-        template: {
-          name: 'absence_reminder',
-          language: { code: 'pl' },
-          components: [
-            {
-              type: 'body',
-              parameters: [
-                { type: 'text', text: row.first_name || '' }
-              ]
-            }
-          ]
-        }
-      };
-
-      const res = await postWA({ phoneId: WA_PHONE_ID, payload });
-      const waMessageId = res.data?.messages?.[0]?.id || null;
-      const status = res.ok ? 'sent' : 'error';
-      const reason = res.ok
-        ? null
-        : (res.status ? `http_${res.status}` : 'send_failed');
-
-      await auditOutbound({
-        userId: row.id,
-        to: toNorm,
-        body: null,
-        messageType: 'template',
-        status,
-        reason,
-        waMessageId,
-        templateName: 'absence_reminder',
-        variables: JSON.stringify([row.first_name])
-      });
-    }
-
-    console.log('[CRON] absence_reminder done, processed', rows.length, 'users');
-  } catch (err) {
-    console.error('[CRON] absence_reminder error', err);
   } finally {
     client.release();
   }
@@ -1509,12 +1369,6 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
   }
 }
 
-// =========================
-// WYSYŁKA INTERAKTYWNEJ LISTY
-// =========================
-
-
-
 app.post('/webhook', async (req, res) => {
   if (DEBUG) {
     console.log('[WEBHOOK] incoming hit');
@@ -1712,25 +1566,19 @@ app.post('/webhook', async (req, res) => {
 // =========================
 
 if (WA_TOKEN && WA_PHONE_ID) {
-  // Niedziela 10:30 – slots week+1
-  cron.schedule(
-    '30 10 * * 0',
-    async () => {
-      await runWeeklySlotsJob();
-    },
-    { timezone: 'Europe/Warsaw' }
-  );
+  cron.schedule('30 10 * * 0', () => runWeeklySlotsJob(), {
+    timezone: 'Europe/Warsaw'
+  });
 
-  // Niedziela 17:00 – absence_reminder
-  cron.schedule(
-    '0 18 * * 0',
-    async () => {
-      await sendAbsenceReminderTemplate();
-    },
-    { timezone: 'Europe/Warsaw' }
-  );
+  cron.schedule('0 18 * * 0', () => sendAbsenceReminderTemplate(), {
+    timezone: 'Europe/Warsaw'
+  });
 
-  console.log('[CRON] Scheduled weekly_slots (Sun 10:30) and absence_reminder (Sun 18:00)');
+  cron.schedule('0 20 * * 0', () => runWeeklySlotsBroadcast(), {
+    timezone: 'Europe/Warsaw'
+  });
+
+  console.log('[CRON] Scheduled weekly_slots (Sun 10:30), absence_reminder (Sun 18:00), weekly_slots_broadcast (Sun 20:00)');
 } else {
   console.log('[CRON] Skipping CRON scheduling (missing WA config)');
 }
@@ -1743,22 +1591,6 @@ cron.schedule(
   },
   { timezone: 'Europe/Warsaw' }
 );
-
-// Ręczny trigger absence_reminder (tylko do testów!)
-app.get('/cron/manual-absence-reminder', async (req, res) => {
-  const token = req.query.token || '';
-  if (token !== process.env.CRON_TEST_TOKEN) {
-    return res.status(403).send('forbidden');
-  }
-
-  try {
-    await sendAbsenceReminderTemplate();
-    return res.status(200).send('absence_reminder triggered');
-  } catch (err) {
-    console.error('[MANUAL] absence_reminder error', err);
-    return res.status(500).send('error');
-  }
-});
 
 app.get('/debug/run-weekly-slots', async (req, res) => {
   // prosty prymitywny safeguard
