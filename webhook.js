@@ -1911,8 +1911,9 @@ async function sendInstructorAbsences7d({ client, to, instructorId }) {
      AND g.instructor_id = $1
     JOIN public.users u
       ON u.id = a.user_id
-    WHERE a.session_date >= current_date - interval '7 days'
-    ORDER BY a.session_date DESC, ct.start_time, g.name, u.first_name, u.last_name
+    WHERE a.session_date >= current_date
+      AND a.session_date < current_date + interval '7 days'
+    ORDER BY a.session_date ASC, ct.start_time, g.name, u.first_name, u.last_name
     `,
     [instructorId]
   );
@@ -1920,21 +1921,21 @@ async function sendInstructorAbsences7d({ client, to, instructorId }) {
   if (!rows.length) {
     await sendText({
       to: toNorm,
-      body: 'W ostatnich 7 dniach nie było zgłoszonych nieobecności w Twoich grupach.'
+      body: 'W najbliższych 7 dniach nie masz zgłoszonych nieobecności w swoich grupach.'
     });
     return;
   }
 
   const lines = rows.map(r => {
-    const d = r.session_date.toISOString().slice(0,10);
-    const [y,m,dd] = d.split('-');
-    const time = r.start_time.toString().slice(0,5);
+    const d = r.session_date.toISOString().slice(0, 10);
+    const [y, m, dd] = d.split('-');
+    const time = r.start_time.toString().slice(0, 5);
     return `• ${dd}/${m} ${time} ${r.group_name}: ${r.first_name} ${r.last_name}`;
   });
 
   await sendText({
     to: toNorm,
-    body: 'Nieobecności w Twoich grupach (ostatnie 7 dni):\n' + lines.join('\n')
+    body: 'Nieobecności w Twoich grupach (najbliższe 7 dni):\n' + lines.join('\n')
   });
 }
 
