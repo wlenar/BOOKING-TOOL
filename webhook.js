@@ -1065,7 +1065,7 @@ async function handleMakeupInteractive({ client, m, sender }) {
         WHERE u.id = $1
       )
       SELECT
-        s.id              AS slot_id,
+        s.id            AS slot_id,
         os.session_date,
         os.session_time,
         os.group_name
@@ -1077,7 +1077,7 @@ async function handleMakeupInteractive({ client, m, sender }) {
         ON e.user_id = u.user_id
        AND e.class_template_id = os.class_template_id
       WHERE
-            s.status = 'open'
+          s.status = 'open'
         AND os.session_date = $2::date
         AND os.class_template_id = $3
         AND os.free_capacity_remaining > 0
@@ -1085,8 +1085,8 @@ async function handleMakeupInteractive({ client, m, sender }) {
         AND (os.price_per_session IS NULL OR os.price_per_session <= u.max_home_price)
         AND e.user_id IS NULL
       ORDER BY s.id
-      FOR UPDATE SKIP LOCKED
       LIMIT 1
+      FOR UPDATE SKIP LOCKED
       `,
       [userId, sessionYmd, classTemplateId]
     );
@@ -1274,14 +1274,18 @@ function parseAbsenceCommand(text) {
 
   const normalized = text.trim().toLowerCase();
 
-  // obsługa:
-  // "Zwalniam dd/mm"
-  // "Zwalniam dd.mm"
-  // "Zwalniam dd-mm"
-  // opcjonalnie: "Zwalniam dd/mm o gg:mm"
-  const m = normalized.match(
+  // wariant 1: "zwalniam dd/mm"
+  let m = normalized.match(
     /^zwalniam\s+(\d{1,2})[./-](\d{1,2})(?:\s+o\s+\d{1,2}[:.]\d{2})?$/
   );
+
+  // wariant 2: samo "dd/mm"
+  if (!m) {
+    m = normalized.match(
+      /^(\d{1,2})[./-](\d{1,2})(?:\s+o\s+\d{1,2}[:.]\d{2})?$/
+    );
+  }
+
   if (!m) return null;
 
   const day = parseInt(m[1], 10);
@@ -1294,8 +1298,7 @@ function parseAbsenceCommand(text) {
   const dd = String(day).padStart(2, '0');
   const mm = String(month).padStart(2, '0');
 
-  const ymd = `${year}-${mm}-${dd}`;
-  return { ymd };
+  return { ymd: `${year}-${mm}-${dd}` };
 }
 
 function parseMainMenuChoice(text) {
