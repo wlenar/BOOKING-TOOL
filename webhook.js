@@ -389,34 +389,61 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
 async function sendMakeupMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
 
-
-  // pobierz dostępne oferty dla tego usera
-  const q = await client.query(
+  // dynamicznie z bazy, bez slot_offers / job_prepare_weekly_slot_offers
+  const { rows } = await client.query(
     `
-    SELECT
-      so.id              AS offer_id,
-      os.slot_id,
-      os.session_date,
-      os.session_time,
-      os.group_name
-    FROM public.slot_offers so
-    JOIN public.v_open_slots_desc os
-      ON os.slot_id = so.slot_id
-    WHERE
-          so.user_id = $1
-      AND so.status IN ('pending', 'sent')
-      AND os.session_date >= current_date
-      AND os.session_date <  current_date + interval '7 days'
-      AND os.free_capacity_remaining > 0
-    ORDER BY os.session_date, os.session_time, os.group_name
+    WITH u AS (
+      SELECT
+        u.id AS user_id,
+        u.level_id,
+        COALESCE(c.balance, 0) AS credits,
+        COALESCE(uhp.max_home_price, 999999::numeric) AS max_home_price
+      FROM public.users u
+      LEFT JOIN public.user_absence_credits c
+        ON c.user_id = u.id
+      LEFT JOIN public.v_user_home_price uhp
+        ON uhp.user_id = u.id
+      WHERE u.id = $1
+        AND u.is_active = true
+    ),
+    candidate_slots AS (
+      SELECT
+        os.session_date,
+        os.session_date_ymd,
+        os.session_time,
+        os.class_template_id,
+        os.group_name,
+        COUNT(*) AS open_slots
+      FROM public.v_open_slots_desc os
+      CROSS JOIN u
+      LEFT JOIN public.enrollments e
+        ON e.user_id = u.user_id
+       AND e.class_template_id = os.class_template_id
+      WHERE
+            u.credits > 0
+        AND os.session_date >= current_date
+        AND os.session_date <  current_date + interval '7 days'
+        AND os.free_capacity_remaining > 0
+        AND (os.required_level IS NULL OR os.required_level <= u.level_id)
+        AND (os.price_per_session IS NULL OR os.price_per_session <= u.max_home_price)
+        AND e.user_id IS NULL
+      GROUP BY
+        os.session_date,
+        os.session_date_ymd,
+        os.session_time,
+        os.class_template_id,
+        os.group_name
+      HAVING COUNT(*) > 0
+    )
+    SELECT *
+    FROM candidate_slots
+    ORDER BY session_date, session_time, group_name
     LIMIT 10
     `,
     [userId]
   );
 
-  const rows = q.rows || [];
-
-  if (rows.length === 0) {
+  if (!rows || rows.length === 0) {
     return sendText({
       to: toNorm,
       body: 'Aktualnie nie ma dostępnych wolnych miejsc do odrabiania w najbliższym tygodniu.',
@@ -437,21 +464,21 @@ async function sendMakeupMenu({ client, to, userId }) {
   }
 
   const listRows = rows.map((r) => {
-    const d = r.session_date;
-    const iso = d instanceof Date
-      ? d.toISOString().slice(0, 10)
-      : String(d).slice(0, 10);
-
-    const [y, m, dd] = iso.split('-');
-    const dateLabel = `${dd}/${m}`;
+    const iso = String(r.session_date_ymd || '').slice(0, 10); // 'YYYY-MM-DD'
+    const [y, m, d] = iso.split('-');
+    const dateLabel = `${d}/${m}`;
     const timeLabel = (r.session_time || '').toString().slice(0, 5);
+    const count = Number(r.open_slots) || 1;
+    const countLabel = count > 1 ? ` (${count} miejsca)` : '';
 
-    const title = `${dateLabel} ${timeLabel}`.trim();
+    let title = `${dateLabel} ${timeLabel}${countLabel}`;
+    if (title.length > 24) title = title.slice(0, 24);
+
     const desc = r.group_name || '';
 
     return {
-      id: `makeup_${r.offer_id}`,
-      title: title.substring(0, 24),
+      id: `makeup_${iso}_${r.class_template_id}`, // 1 wiersz = 1 termin
+      title,
       ...(desc ? { description: desc.substring(0, 80) } : {})
     };
   });
@@ -479,9 +506,7 @@ async function sendMakeupMenu({ client, to, userId }) {
 
   const res = await postWA({ phoneId: WA_PHONE_ID, payload });
 
-  const bodyLog =
-    'MAKEUP_MENU: ' + listRows.map(r => r.title).join(' | ');
-
+  const bodyLog = 'MAKEUP_MENU: ' + listRows.map(r => r.title).join(' | ');
   const waMessageId = res.data?.messages?.[0]?.id || null;
   const status = res.ok ? 'sent' : 'error';
   const reason = res.ok
@@ -872,8 +897,20 @@ async function handleMakeupInteractive({ client, m, sender }) {
   const id = reply?.id || '';
   if (!id.startsWith('makeup_')) return false;
 
-  const offerId = parseInt(id.replace('makeup_', ''), 10);
-  if (!offerId || Number.isNaN(offerId)) {
+  // format: makeup_YYYY-MM-DD_classTemplateId
+  const parts = id.split('_');
+  if (parts.length !== 3) {
+    await sendText({
+      to: m.from,
+      userId: sender.id,
+      body: 'Nie udało się rozpoznać wybranego terminu. Spróbuj proszę ponownie.'
+    });
+    return true;
+  }
+
+  const sessionYmd = parts[1];
+  const classTemplateId = parseInt(parts[2], 10);
+  if (!classTemplateId || Number.isNaN(classTemplateId)) {
     await sendText({
       to: m.from,
       userId: sender.id,
@@ -888,54 +925,19 @@ async function handleMakeupInteractive({ client, m, sender }) {
   try {
     await client.query('BEGIN');
 
-    // 1) Pobierz ofertę + slot + kredyt z blokadą
-    const { rows, rowCount } = await client.query(
+    // 1) kredyt z blokadą
+    const creditRes = await client.query(
       `
-      SELECT
-        so.id          AS offer_id,
-        so.user_id,
-        so.slot_id,
-        s.session_date,
-        ct.start_time,
-        g.name         AS group_name,
-        uac.balance
-      FROM public.slot_offers so
-      JOIN public.slots s
-        ON s.id = so.slot_id
-      JOIN public.class_templates ct
-        ON ct.id = s.class_template_id
-      JOIN public.groups g
-        ON g.id = ct.group_id
-      JOIN public.user_absence_credits uac
-        ON uac.user_id = so.user_id
-      WHERE so.id = $1
-        AND so.user_id = $2
-        AND so.status IN ('pending', 'sent')
+      SELECT COALESCE(balance, 0) AS balance
+      FROM public.user_absence_credits
+      WHERE user_id = $1
       FOR UPDATE
       `,
-      [offerId, userId]
+      [userId]
     );
-
-    if (rowCount === 0) {
+    const balance = creditRes.rows[0]?.balance || 0;
+    if (balance <= 0) {
       await client.query('ROLLBACK');
-      await sendText({
-        to,
-        userId,
-        body: 'Nie udało się zarezerwować tego terminu. Wybierz proszę inny z listy.'
-      });
-      return true;
-    }
-
-    const offer = rows[0];
-
-    if (offer.balance <= 0) {
-      await client.query(
-        `UPDATE public.slot_offers
-           SET status = 'error', updated_at = now()
-         WHERE id = $1`,
-        [offerId]
-      );
-      await client.query('COMMIT');
       await sendText({
         to,
         userId,
@@ -944,111 +946,105 @@ async function handleMakeupInteractive({ client, m, sender }) {
       return true;
     }
 
-    // 2) Zajmij slot (race-safe)
-    const updSlot = await client.query(
+    // 2) wybierz 1 konkretny slot w tym terminie (zgodny z logiką menu)
+    const slotRes = await client.query(
       `
-      UPDATE public.slots
-         SET status = 'taken',
-             taken_by_user_id = $1,
-             taken_at = now()
-       WHERE id = $2
-         AND status = 'open'
-         AND taken_by_user_id IS NULL
-       RETURNING id
+      WITH u AS (
+        SELECT
+          u.id AS user_id,
+          u.level_id,
+          COALESCE(uhp.max_home_price, 999999::numeric) AS max_home_price
+        FROM public.users u
+        LEFT JOIN public.v_user_home_price uhp
+          ON uhp.user_id = u.id
+        WHERE u.id = $1
+      )
+      SELECT
+        s.id              AS slot_id,
+        os.session_date,
+        os.session_time,
+        os.group_name
+      FROM public.slots s
+      JOIN public.v_open_slots_desc os
+        ON os.slot_id = s.id
+      CROSS JOIN u
+      LEFT JOIN public.enrollments e
+        ON e.user_id = u.user_id
+       AND e.class_template_id = os.class_template_id
+      WHERE
+            s.status = 'open'
+        AND os.session_date = $2::date
+        AND os.class_template_id = $3
+        AND os.free_capacity_remaining > 0
+        AND (os.required_level IS NULL OR os.required_level <= u.level_id)
+        AND (os.price_per_session IS NULL OR os.price_per_session <= u.max_home_price)
+        AND e.user_id IS NULL
+      ORDER BY s.id
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
       `,
-      [userId, offer.slot_id]
+      [userId, sessionYmd, classTemplateId]
     );
 
-    if (updSlot.rowCount === 0) {
-      await client.query(
-        `UPDATE public.slot_offers
-           SET status = 'expired', updated_at = now()
-         WHERE id = $1`,
-        [offerId]
-      );
-      await client.query('COMMIT');
+    if (slotRes.rowCount === 0) {
+      await client.query('ROLLBACK');
       await sendText({
         to,
         userId,
-        body: 'Ten termin został właśnie zajęty przez inną osobę. Wybierz proszę inny.'
+        body: 'Wybrany termin nie jest już dostępny. Wybierz proszę inny termin.'
       });
       return true;
     }
 
-    // 3) Zmniejsz kredyt
-    const updCred = await client.query(
+    const slot = slotRes.rows[0];
+
+    // 3) oznacz slot jako zajęty przez usera
+    await client.query(
+      `
+      UPDATE public.slots
+      SET status = 'taken',
+          taken_by_user_id = $1,
+          taken_at = now(),
+          updated_at = now()
+      WHERE id = $2
+      `,
+      [userId, slot.slot_id]
+    );
+
+    // 4) zmniejsz kredyt
+    await client.query(
       `
       UPDATE public.user_absence_credits
-         SET balance = balance - 1,
-             updated_at = now()
-       WHERE user_id = $1
-         AND balance > 0
-       RETURNING balance
+      SET balance = balance - 1,
+          updated_at = now()
+      WHERE user_id = $1
       `,
       [userId]
     );
 
-    if (updCred.rowCount === 0) {
-      // rollback slotu jeśli coś się omsknęło
-      await client.query(
-        `
-        UPDATE public.slots
-           SET status = 'open',
-               taken_by_user_id = NULL,
-               taken_at = NULL
-         WHERE id = $1
-        `,
-        [offer.slot_id]
-      );
-      await client.query(
-        `UPDATE public.slot_offers
-           SET status = 'error', updated_at = now()
-         WHERE id = $1`,
-        [offerId]
-      );
-      await client.query('COMMIT');
-      await sendText({
-        to,
-        userId,
-        body: 'Nie udało się pobrać kredytu. Rezerwacja została anulowana.'
-      });
-      return true;
-    }
-
-    // 4) Oznacz ofertę jako zaakceptowaną
-    await client.query(
-      `
-      UPDATE public.slot_offers
-         SET status = 'accepted',
-             updated_at = now()
-       WHERE id = $1
-      `,
-      [offerId]
-    );
-
     await client.query('COMMIT');
 
-    // 5) Potwierdzenie
-    const d = offer.session_date instanceof Date
-      ? offer.session_date.toISOString().slice(0, 10)
-      : String(offer.session_date).slice(0, 10);
-    const [y, m, dd] = d.split('-');
-    const time = (offer.start_time || '').toString().slice(0, 5);
+    const d = slot.session_date instanceof Date
+      ? slot.session_date.toISOString().slice(0, 10)
+      : String(slot.session_date).slice(0, 10);
+    const [y, m2, d2] = d.split('-');
+    const dateLabel = `${d2}/${m2}`;
+    const timeLabel = (slot.session_time || '').toString().slice(0, 5);
 
     await sendText({
       to,
       userId,
-      body: `✔️ Termin ${dd}/${m} ${time} ${offer.group_name} został zarezerwowany jako odrabianie.`
+      body: `✔️ Potwierdzam rezerwację miejsca do odrabiania: ${dateLabel} ${timeLabel}, ${slot.group_name}.`
     });
 
     return true;
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (e) {}
-    console.error('[makeup] error', err);
+    await client.query('ROLLBACK');
+    console.error('[handleMakeupInteractive] error', err);
     await sendText({
       to,
       userId,
-      body: 'Wystąpił błąd przy rezerwacji tego terminu. Spróbuj ponownie lub wybierz inny.'
+      body: 'Coś poszło nie tak przy rezerwacji miejsca do odrabiania. Spróbuj ponownie lub skontaktuj się ze studiem.'
     });
     return true;
   }
