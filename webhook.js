@@ -211,6 +211,92 @@ async function getUpcomingUserClasses(client, userId) {
   return res.rows;
 }
 
+async function sendMainMenu({ to, userId }) {
+  const toNorm = normalizeTo(to);
+
+  // jeśli brak konfiguracji WA – logujemy i wychodzimy
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: 'MENU_GLOWNE: pominięte (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_list',
+      status: 'skipped',
+      reason: 'missing_credentials'
+    });
+    return;
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: {
+        text: 'Co chcesz zrobić?'
+      },
+      action: {
+        button: 'Otwórz menu',
+        sections: [
+          {
+            title: 'Dostępne opcje',
+            rows: [
+              {
+                id: 'menu_absence',
+                title: 'Zgłoś nieobecność',
+                description: 'Zwolnij miejsce na konkretne zajęcia'
+              },
+              {
+                id: 'menu_makeup',
+                title: 'Odrabianie zajęć',
+                description: 'Zarezerwuj termin z wolnych miejsc'
+              },
+              {
+                id: 'menu_credits',
+                title: 'Ile mam nieobecności?',
+                description: 'Sprawdź liczbę do odrobienia'
+              },
+              {
+                id: 'menu_end',
+                title: 'Zakończ rozmowę',
+                description: 'Zamknij rozmowę bez zmian'
+              }
+            ]
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog =
+    'MENU_GLOWNE: [Zgłoś nieobecność] [Odrabianie zajęć] [Ile mam nieobecności?] [Zakończ rozmowę]';
+
+  if (res.ok) {
+    const waMessageId = res.data?.messages?.[0]?.id || null;
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: bodyLog,
+      messageType: 'interactive_list',
+      status: 'sent',
+      waMessageId
+    });
+  } else {
+    const reason = res.status ? `http_${res.status}` : 'send_failed';
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: bodyLog,
+      messageType: 'interactive_list',
+      status: 'error',
+      reason
+    });
+  }
+}
+
 async function sendUpcomingClassesMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
   const rows = await getUpcomingUserClasses(client, userId);
@@ -1523,15 +1609,6 @@ if (WA_TOKEN && WA_PHONE_ID) {
 } else {
   console.log('[CRON] Skipping CRON scheduling (missing WA config)');
 }
-
-// Niedziela 20:00 – broadcast wolnych slotów do kwalifikujących się użytkowników
-cron.schedule(
-  '0 20 * * 0',
-  async () => {
-    await runWeeklySlotsBroadcast();
-  },
-  { timezone: 'Europe/Warsaw' }
-);
 
 app.get('/debug/run-weekly-slots', async (req, res) => {
   // prosty prymitywny safeguard
