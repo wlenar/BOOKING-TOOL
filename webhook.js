@@ -893,7 +893,6 @@ async function handleAbsenceInteractive({ client, m, sender }) {
         body: 'Napisz proszę wiadomość w formacie: "Zwalniam dd/mm" dla innego terminu.',
         userId: sender.id
       });
-      await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
       return true;
     }
 
@@ -1084,9 +1083,9 @@ async function handleMakeupInteractive({ client, m, sender }) {
         AND (os.required_level IS NULL OR os.required_level <= u.level_id)
         AND (os.price_per_session IS NULL OR os.price_per_session <= u.max_home_price)
         AND e.user_id IS NULL
-      ORDER BY s.id
-      LIMIT 1
-      FOR UPDATE SKIP LOCKED
+        ORDER BY s.id
+        LIMIT 1
+        FOR UPDATE OF s SKIP LOCKED
       `,
       [userId, sessionYmd, classTemplateId]
     );
