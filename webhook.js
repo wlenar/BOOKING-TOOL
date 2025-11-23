@@ -1504,11 +1504,17 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
           (timeLabel ? ` ${timeLabel}` : '') +
           ` na grupie ${info.group_name}. Miejsce zostało zwolnione do odrabiania.`;
 
-        await sendText({
+        //1) proba wysłania zwykłkej wiadomości tekstowej          
+        const sendRes = await sendText({
           to: info.instr_phone,
           body,
           userId: null
         });
+
+        // jeśli Meta odrzuci - fallback do template
+        if (!sendRes.ok) {
+          await sendInstructorAbsenceTemplate({ info });
+        }
       }
     } catch (notifyErr) {
       console.error('[processAbsence] notify instructor error', notifyErr);
@@ -1521,6 +1527,81 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
     return { ok: false, reason: 'exception', error: err.message };
   }
 }
+
+async function sendInstructorAbsenceTemplate({ info }) {
+  const toNorm = normalizeTo(info.instr_phone);
+
+  // ⬇ PODMIEŃ nazwę szablonu na dokładną z Business Managera
+  const TEMPLATE_NAME = 'update_do_trenera';
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: null,
+      to: toNorm,
+      body: `TEMPLATE: ${TEMPLATE_NAME} (brak konfiguracji WhatsApp API)`,
+      templateName: TEMPLATE_NAME,
+      variables: null,
+      messageType: 'template',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const userFullName = (info.user_first_name || '') +
+    (info.user_last_name ? ` ${info.user_last_name}` : '');
+  const who = userFullName.trim() || 'Klient';
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'template',
+    template: {
+      name: TEMPLATE_NAME,
+      language: { code: 'pl' },
+      components: [
+        {
+          type: 'body',
+          parameters: [
+            // {1} = imię instruktora
+            { type: 'text', text: info.instr_first_name || 'Instruktorze' },
+            // {2} = imię + nazwisko klienta
+            { type: 'text', text: who },
+            // {3} = data nieobecności, np. "12.11"
+            { type: 'text', text: info.session_date_label }
+          ]
+        }
+      ]
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok
+    ? null
+    : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId: null,
+    to: toNorm,
+    body: `TEMPLATE: ${TEMPLATE_NAME}`,
+    templateName: TEMPLATE_NAME,
+    variables: JSON.stringify({
+      '{1}': info.instr_first_name || 'Instruktorze',
+      '{2}': who,
+      '{3}': info.session_date_label
+    }),
+    messageType: 'template',
+    status,
+    reason,
+    waMessageId
+  });
+
+  return res;
+}
+
 
 app.post('/webhook', async (req, res) => {
   if (DEBUG) {
