@@ -1203,7 +1203,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
               buttons: [
                 {
                   type: 'reply',
-                  reply: { id: 'credits_makeup', title: '🎯 Zobacz wolne terminy' }
+                  reply: { id: 'credits_makeup', title: '🎯 Wolne terminy' }
                 },
                 {
                   type: 'reply',
