@@ -1215,6 +1215,28 @@ async function handleMainMenuInteractive({ client, m, sender }) {
         };
 
         const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+        // 🔎 DEBUG: zaloguj dokładny błąd z WA, jeśli jest
+        if (!res.ok) {
+          try {
+            console.error(
+              '[CREDITS_FOLLOWUP] WA error',
+              res.status,
+              JSON.stringify(res.data || {}, null, 2)
+            );
+          } catch (e) {
+            console.error('[CREDITS_FOLLOWUP] WA error (no data)', res.status);
+          }
+
+          // Fallback, żeby rozmowa się nie urywała:
+          await sendText({
+            to: m.from,
+            userId: sender.id,
+            body:
+              'Jeśli chcesz zobaczyć wolne terminy do odrabiania, wpisz proszę "menu" i wybierz opcję "🎯 Odrób zajęcia".'
+          });
+        }
+
         const bodyLog = 'CREDITS_FOLLOWUP: [Zobacz wolne terminy] [Menu główne]';
         const waMessageId = res.data?.messages?.[0]?.id || null;
         const status = res.ok ? 'sent' : 'error';
