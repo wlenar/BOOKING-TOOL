@@ -582,11 +582,59 @@ async function sendMakeupMenu({ client, to, userId }) {
   }
 
   if ((u.credits || 0) <= 0) {
-    return sendText({
+    // komunikat o braku nieobecności
+    await sendText({
       to: toNorm,
       userId,
       body: 'Nie masz obecnie nieobecności do odrobienia.'
     });
+
+    // follow-up: Menu główne / Zakończ rozmowę
+    if (WA_TOKEN && WA_PHONE_ID) {
+      const payload = {
+        messaging_product: 'whatsapp',
+        to: toNorm,
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: {
+            text: 'Co chcesz zrobić dalej?'
+          },
+          action: {
+            buttons: [
+              {
+                type: 'reply',
+                reply: { id: 'no_credits_menu', title: '🏠 Menu główne' }
+              },
+              {
+                type: 'reply',
+                reply: { id: 'no_credits_end', title: '🏁 Zakończ rozmowę' }
+              }
+            ]
+          }
+        }
+      };
+
+      const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+      const bodyLog = 'NO_CREDITS_FOLLOWUP: [Menu główne] [Zakończ rozmowę]';
+      const waMessageId = res.data?.messages?.[0]?.id || null;
+      const status = res.ok ? 'sent' : 'error';
+      const reason = res.ok
+        ? null
+        : (res.status ? `http_${res.status}` : 'send_failed');
+
+      await auditOutbound({
+        userId,
+        to: toNorm,
+        body: bodyLog,
+        messageType: 'interactive_buttons',
+        status,
+        reason,
+        waMessageId
+      });
+    }
+
+    return;
   }
 
   const { rows } = await client.query(
@@ -1175,19 +1223,66 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     }
 
     if (id === 'menu_credits') {
-      const { rows } = await client.query(
-        'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
-        [sender.id]
-      );
-      const bal = rows[0]?.balance || 0;
+    const { rows } = await client.query(
+      'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
+      [sender.id]
+    );
+    const bal = rows[0]?.balance || 0;
 
-      await sendText({
-        to: m.from,
-        body: `Masz ${bal} nieobecności do odrobienia.`,
-        userId: sender.id
-      });
+    await sendText({
+      to: m.from,
+      body: `Masz ${bal} nieobecności do odrobienia.`,
+      userId: sender.id
+    });
 
-      // follow-up: przyciski "wolne terminy" / "menu główne"
+    // przy 0: tylko Menu główne / Zakończ rozmowę
+    if (bal <= 0) {
+      if (WA_TOKEN && WA_PHONE_ID) {
+        const toNorm = normalizeTo(m.from);
+        const payload = {
+          messaging_product: 'whatsapp',
+          to: toNorm,
+          type: 'interactive',
+          interactive: {
+            type: 'button',
+            body: {
+              text: 'Co chcesz zrobić dalej?'
+            },
+            action: {
+              buttons: [
+                {
+                  type: 'reply',
+                  reply: { id: 'no_credits_menu', title: '🏠 Menu główne' }
+                },
+                {
+                  type: 'reply',
+                  reply: { id: 'no_credits_end', title: '🏁 Zakończ rozmowę' }
+                }
+              ]
+            }
+          }
+        };
+
+        const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+        const bodyLog = 'NO_CREDITS_FOLLOWUP: [Menu główne] [Zakończ rozmowę]';
+        const waMessageId = res.data?.messages?.[0]?.id || null;
+        const status = res.ok ? 'sent' : 'error';
+        const reason = res.ok
+          ? null
+          : (res.status ? `http_${res.status}` : 'send_failed');
+
+        await auditOutbound({
+          userId: sender.id,
+          to: toNorm,
+          body: bodyLog,
+          messageType: 'interactive_buttons',
+          status,
+          reason,
+          waMessageId
+        });
+      }
+    } else {
+      // >0 – poprzednie zachowanie: "Wolne terminy" / "Menu"
       if (WA_TOKEN && WA_PHONE_ID) {
         const toNorm = normalizeTo(m.from);
         const payload = {
@@ -1207,7 +1302,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
                 },
                 {
                   type: 'reply',
-                  reply: { id: 'credits_menu', title: '🏠 Menu główne' }
+                  reply: { id: 'credits_menu', title: '🏠 Menu' }
                 }
               ]
             }
@@ -1215,29 +1310,7 @@ async function handleMainMenuInteractive({ client, m, sender }) {
         };
 
         const res = await postWA({ phoneId: WA_PHONE_ID, payload });
-
-        // 🔎 DEBUG: zaloguj dokładny błąd z WA, jeśli jest
-        if (!res.ok) {
-          try {
-            console.error(
-              '[CREDITS_FOLLOWUP] WA error',
-              res.status,
-              JSON.stringify(res.data || {}, null, 2)
-            );
-          } catch (e) {
-            console.error('[CREDITS_FOLLOWUP] WA error (no data)', res.status);
-          }
-
-          // Fallback, żeby rozmowa się nie urywała:
-          await sendText({
-            to: m.from,
-            userId: sender.id,
-            body:
-              'Jeśli chcesz zobaczyć wolne terminy do odrabiania, wpisz proszę "menu" i wybierz opcję "🎯 Odrób zajęcia".'
-          });
-        }
-
-        const bodyLog = 'CREDITS_FOLLOWUP: [Zobacz wolne terminy] [Menu główne]';
+        const bodyLog = 'CREDITS_FOLLOWUP: [Wolne terminy] [Menu]';
         const waMessageId = res.data?.messages?.[0]?.id || null;
         const status = res.ok ? 'sent' : 'error';
         const reason = res.ok
@@ -1254,9 +1327,10 @@ async function handleMainMenuInteractive({ client, m, sender }) {
           waMessageId
         });
       }
-
-      return true;
     }
+
+    return true;
+  }
 
     if (id === 'menu_end') {
       await sendText({
@@ -1281,6 +1355,20 @@ async function handleMainMenuInteractive({ client, m, sender }) {
 
     if (replyId === 'credits_menu') {
       await sendMainMenu({ to: m.from, userId: sender.id });
+      return true;
+    }
+
+    if (replyId === 'no_credits_menu') {
+      await sendMainMenu({ to: m.from, userId: sender.id });
+      return true;
+    }
+
+    if (replyId === 'no_credits_end') {
+      await sendText({
+        to: m.from,
+        body: 'Dziękujemy za kontakt. Do zobaczenia!',
+        userId: sender.id
+      });
       return true;
     }
 
