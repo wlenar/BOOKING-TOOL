@@ -1492,27 +1492,52 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
 
       const info = infoRows[0];
       if (info && info.instr_phone) {
-        const timeLabel = info.start_time
-          ? info.start_time.toString().slice(0, 5)
-          : '';
-        const userFullName = (info.user_first_name || '') +
+        // identyfikacja WA-ID instruktora tak jak w inbox_messages (bez "+")
+        const instrWaId = normalizeTo(info.instr_phone);
+
+        // ostatnia interakcja instruktora z naszym numerem
+        const { rows: inboundRows } = await client.query(
+          `
+          SELECT sent_ts
+          FROM inbox_messages
+          WHERE source = 'whatsapp'
+            AND message_direction = 'inbound'
+            AND from_wa_id = $1
+          ORDER BY sent_ts DESC
+          LIMIT 1
+          `,
+          [instrWaId]
+        );
+
+        const lastTs = inboundRows[0]?.sent_ts
+          ? new Date(inboundRows[0].sent_ts)
+          : null;
+        const now = new Date();
+
+        const hasInteractionLast24h =
+          lastTs && (now.getTime() - lastTs.getTime()) < 24 * 60 * 60 * 1000;
+
+        const userFullName =
+          (info.user_first_name || '') +
           (info.user_last_name ? ` ${info.user_last_name}` : '');
         const who = userFullName.trim() || 'Klient';
+        const absLabel = info.session_date_label;
 
-        const body =
-          `Info: ${who} zgłosił nieobecność ${info.session_date_label}` +
-          (timeLabel ? ` ${timeLabel}` : '') +
-          ` na grupie ${info.group_name}. Miejsce zostało zwolnione do odrabiania.`;
+        // TREŚĆ spójna z szablonem WhatsApp:
+        // "Cześć <imie>\n\n<imie1> zgłosił(a) nieobezność dnia <nieobecnosc>"
+        const unifiedText =
+          `Cześć ${info.instr_first_name || 'Instruktorze'}\n\n` +
+          `${who} zgłosił(a) nieobezność dnia ${absLabel}`;
 
-        //1) proba wysłania zwykłkej wiadomości tekstowej          
-        const sendRes = await sendText({
-          to: info.instr_phone,
-          body,
-          userId: null
-        });
-
-        // jeśli Meta odrzuci - fallback do template
-        if (!sendRes.ok) {
+        if (hasInteractionLast24h) {
+          // mieliśmy kontakt <24h -> zwykły tekst
+          await sendText({
+            to: info.instr_phone,
+            body: unifiedText,
+            userId: null
+          });
+        } else {
+          // brak kontaktu <24h -> template (formularz)
           await sendInstructorAbsenceTemplate({ info });
         }
       }
