@@ -1831,13 +1831,8 @@ app.post('/webhook', async (req, res) => {
                   await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
                   localHandled = true;
                 } else if (choice === 'makeup') {
-                  await sendText({
-                    to: m.from,
-                    body: 'Odrabianie zajęć: napisz proszę termin, który Cię interesuje, a studio potwierdzi dostępność.',
-                    userId: sender.id
-                  });
+                  await sendMakeupMenu({ client, to: m.from, userId: sender.id });
                   localHandled = true;
-
                 } else if (choice === 'credits') {
                   const { rows } = await client.query(
                     'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
