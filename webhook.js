@@ -2068,7 +2068,7 @@ async function sendPaymentReminderTemplate() {
         type: 'template',
         template: {
           name: 'payment_reminder',
-          language: { code: 'pl' }
+          language: { code: 'en_US' }
           // brak components – template bez zmiennych
         }
       };
