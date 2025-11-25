@@ -2021,6 +2021,87 @@ async function sendAbsenceReminderTemplate() {
   }
 }
 
+async function sendPaymentReminderTemplate() {
+  if (!WA_TOKEN || ! WA_PHONE_ID) {
+    console.log('[CRON] payment_reminder skipped (missing WA config)');
+    return;
+  }
+
+  const client = await pool.connect();
+
+  try {
+    console.log('[CRON] payment_reminder start');
+
+    const { rows } = await client.query(
+      `
+      SELECT
+        id AS user_id,
+        COALESCE(
+          phone_e164,
+          CASE
+            WHEN phone_raw IS NOT NULL
+            THEN '+' || REGEXP_REPLACE(phone_raw, '^\\+?', '')
+            ELSE NULL
+          END
+        ) AS phone
+      FROM public.users
+      WHERE is_active = true
+        AND (
+          phone_e164 IS NOT NULL
+          OR phone_raw IS NOT NULL
+        )
+      `
+    );
+
+    if (!rows.length) {
+      console.log('[CRON] payment_reminder no active users with phone');
+      return;
+    }
+
+    for (const u of rows) {
+      const toNorm = normalizeTo(u.phone);
+      if (!toNorm) continue;
+
+      const payload = {
+        messaging_product: 'whatsapp',
+        to: toNorm,
+        type: 'template',
+        template: {
+          name: 'payment_reminder',
+          language: { code: 'pl' }
+          // brak components – template bez zmiennych
+        }
+      };
+
+      const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+      const waMessageId = res.data?.messages?.[0]?.id || null;
+      const status = res.ok ? 'sent' : 'error';
+      const reason = res.ok
+        ? null
+        : (res.status ? `http_${res.status}` : 'send_failed');
+
+      await auditOutbound({
+        userId: u.user_id,
+        to: toNorm,
+        body: 'TEMPLATE: payment_reminder',
+        templateName: 'payment_reminder',
+        variables: null,
+        messageType: 'template',
+        status,
+        reason,
+        waMessageId
+      });
+    }
+
+    console.log('[CRON] payment_reminder done, users:', rows.length);
+  } catch (err) {
+    console.error('[CRON] payment_reminder error', err);
+  } finally {
+    client.release();
+  }
+}
+
 async function sendInstructorClassesForDay({ client, to, instructorId, dayOffset }) {
   const toNorm = normalizeTo(to);
 
@@ -2496,7 +2577,12 @@ if (WA_TOKEN && WA_PHONE_ID) {
     timezone: 'Europe/Warsaw'
   });
 
-  console.log('[CRON] Scheduled weekly_slots (Sun 10:30), absence_reminder (Sun 18:00), weekly_slots_broadcast (Sun 20:00)');
+  // nowy CRON: 25-go dnia miesiąca, 18:00
+  cron.schedule('0 18 25 * *', () => sendPaymentReminderTemplate(), {
+    timezone: 'Europe/Warsaw'
+  });
+
+  console.log('[CRON] Scheduled weekly_slots (Sun 10:30), absence_reminder (Sun 18:00), weekly_slots_broadcast (Sun 20:00), payment_reminder (25th 18:00)');
 } else {
   console.log('[CRON] Skipping CRON scheduling (missing WA config)');
 }
