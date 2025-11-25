@@ -2074,6 +2074,18 @@ async function sendPaymentReminderTemplate() {
       };
 
       const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+      
+      if (!res.ok) {
+        try {
+          console.error(
+            '[PAYMENT_REMINDER] WA error',
+            res.status,
+            JSON.stringify(res.data || {}, null, 2)
+          );
+        } catch (e) {
+          console.error('[PAYMENT_REMINDER] WA error (no data)', res.status);
+        }
+      }
 
       const waMessageId = res.data?.messages?.[0]?.id || null;
       const status = res.ok ? 'sent' : 'error';
@@ -2599,6 +2611,21 @@ app.get('/debug/run-weekly-slots', async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error('[DEBUG] run-weekly-slots error', err);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+app.get('/debug/run-payment-reminder', async (req, res) => {
+  const token = req.query.token;
+  if (!token || token !== process.env.DEBUG_TOKEN) {
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+
+  try {
+    await sendPaymentReminderTemplate();
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[DEBUG] run-payment-reminder error', err);
     return res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
