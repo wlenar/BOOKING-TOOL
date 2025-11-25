@@ -1693,7 +1693,7 @@ async function sendInstructorAbsenceTemplate({ info }) {
     type: 'template',
     template: {
       name: TEMPLATE_NAME,
-      language: { code: 'pl' },
+      language: { code: 'en' },
       components: [
         {
           type: 'body',
