@@ -289,7 +289,11 @@ async function getUpcomingUserClasses(client, userId) {
      AND g.is_active = true
     LEFT JOIN public.locations l
       ON l.id = g.location_id
+    LEFT JOIN public.banking_holidays bh
+      ON bh.holiday_date = d::date
+     AND bh.is_active = true
     WHERE EXTRACT(ISODOW FROM d) = ct.weekday_iso
+      AND bh.holiday_date IS NULL        -- ⬅️ kluczowe: odfiltruj święta
     ORDER BY session_date, ct.start_time, class_template_id;
   `;
   const res = await client.query(sql, [userId]);
@@ -1254,6 +1258,9 @@ async function handleMakeupInteractive({ client, m, sender }) {
         userId,
         body: 'Wybrany termin nie jest już dostępny. Wybierz proszę inny termin.'
       });
+      // wysylamy menu aktywnych terminów
+      await sendMakeupMenu({ client, to, userId });
+      
       return true;
     }
 
@@ -1707,7 +1714,7 @@ async function sendInstructorAbsenceTemplate({ info }) {
     type: 'template',
     template: {
       name: TEMPLATE_NAME,
-      language: { code: 'en' },
+      language: { code: 'pl' },
       components: [
         {
           type: 'body',
@@ -2038,7 +2045,7 @@ async function sendAbsenceReminderTemplate() {
 }
 
 async function sendPaymentReminderTemplate() {
-  if (!WA_TOKEN || ! WA_PHONE_ID) {
+  if (!WA_TOKEN || !WA_PHONE_ID) {
     console.log('[CRON] payment_reminder skipped (missing WA config)');
     return;
   }
@@ -2084,7 +2091,7 @@ async function sendPaymentReminderTemplate() {
         type: 'template',
         template: {
           name: 'payment_reminder',
-          language: { code: 'en' }
+          language: { code: 'pl' }
           // brak components – template bez zmiennych
         }
       };
@@ -2512,9 +2519,12 @@ async function sendInstructorStats7d({ client, to, instructorId }) {
   const s = rows[0] || {
     total_classes: 0,
     total_absences: 0,
-    total_open_slots: 0,
+    total_open_slots: 0, // zostawiamy w obiekcie, ale nie używamy
     total_makeups: 0
   };
+
+  const usedMakeups = s.total_makeups;
+  const unusedMakeups = Math.max(s.total_absences - s.total_makeups, 0);
 
   await sendText({
     to: toNorm,
@@ -2522,8 +2532,8 @@ async function sendInstructorStats7d({ client, to, instructorId }) {
       'Ostatnie 7 dni (Twoje grupy):\n' +
       `• Zajęcia: ${s.total_classes}\n` +
       `• Zgłoszone nieobecności: ${s.total_absences}\n` +
-      `• Udostępnione wolne miejsca: ${s.total_open_slots}\n` +
-      `• Zajęte miejsca do odrabiania: ${s.total_makeups}`
+      `• Odrabiane miejsca: ${usedMakeups}\n` +
+      `• Niewykorzystane miejsca: ${unusedMakeups}`
   });
 }
 
@@ -2606,7 +2616,7 @@ if (WA_TOKEN && WA_PHONE_ID) {
   });
 
   // nowy CRON: 25-go dnia miesiąca, 18:00
-  cron.schedule('0 18 25 * *', () => sendPaymentReminderTemplate(), {
+  cron.schedule('0 18 22 * *', () => sendPaymentReminderTemplate(), {
     timezone: 'Europe/Warsaw'
   });
 
