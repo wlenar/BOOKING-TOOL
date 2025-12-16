@@ -1332,115 +1332,13 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     }
 
     if (id === 'menu_credits') {
-    const { rows } = await client.query(
-      'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
-      [sender.id]
-    );
-    const bal = rows[0]?.balance || 0;
-
-    await sendText({
-      to: m.from,
-      body: `Masz ${bal} nieobecności do odrobienia.`,
-      userId: sender.id
-    });
-
-    // przy 0: tylko Menu główne / Zakończ rozmowę
-    if (bal <= 0) {
-      if (WA_TOKEN && WA_PHONE_ID) {
-        const toNorm = normalizeTo(m.from);
-        const payload = {
-          messaging_product: 'whatsapp',
-          to: toNorm,
-          type: 'interactive',
-          interactive: {
-            type: 'button',
-            body: {
-              text: 'Co chcesz zrobić dalej?'
-            },
-            action: {
-              buttons: [
-                {
-                  type: 'reply',
-                  reply: { id: 'no_credits_menu', title: '🏠 Menu główne' }
-                },
-                {
-                  type: 'reply',
-                  reply: { id: 'no_credits_end', title: '🏁 Zakończ rozmowę' }
-                }
-              ]
-            }
-          }
-        };
-
-        const res = await postWA({ phoneId: WA_PHONE_ID, payload });
-        const bodyLog = 'NO_CREDITS_FOLLOWUP: [Menu główne] [Zakończ rozmowę]';
-        const waMessageId = res.data?.messages?.[0]?.id || null;
-        const status = res.ok ? 'sent' : 'error';
-        const reason = res.ok
-          ? null
-          : (res.status ? `http_${res.status}` : 'send_failed');
-
-        await auditOutbound({
-          userId: sender.id,
-          to: toNorm,
-          body: bodyLog,
-          messageType: 'interactive_buttons',
-          status,
-          reason,
-          waMessageId
-        });
-      }
-    } else {
-      // >0 – poprzednie zachowanie: "Wolne terminy" / "Menu"
-      if (WA_TOKEN && WA_PHONE_ID) {
-        const toNorm = normalizeTo(m.from);
-        const payload = {
-          messaging_product: 'whatsapp',
-          to: toNorm,
-          type: 'interactive',
-          interactive: {
-            type: 'button',
-            body: {
-              text: 'Co chcesz zrobić dalej?'
-            },
-            action: {
-              buttons: [
-                {
-                  type: 'reply',
-                  reply: { id: 'credits_makeup', title: '🎯 Wolne terminy' }
-                },
-                {
-                  type: 'reply',
-                  reply: { id: 'credits_menu', title: '🏠 Menu' }
-                }
-              ]
-            }
-          }
-        };
-
-        const res = await postWA({ phoneId: WA_PHONE_ID, payload });
-        const bodyLog = 'CREDITS_FOLLOWUP: [Wolne terminy] [Menu]';
-        const waMessageId = res.data?.messages?.[0]?.id || null;
-        const status = res.ok ? 'sent' : 'error';
-        const reason = res.ok
-          ? null
-          : (res.status ? `http_${res.status}` : 'send_failed');
-
-        await auditOutbound({
-          userId: sender.id,
-          to: toNorm,
-          body: bodyLog,
-          messageType: 'interactive_buttons',
-          status,
-          reason,
-          waMessageId
-        });
-      }
-    }
-
+      await sendCreditsInfoAndFollowup({
+        client,
+        to: m.from,
+        userId: sender.id
+      });
     return true;
   }
-
     if (id === 'menu_end') {
       await sendText({
         to: m.from,
@@ -1950,10 +1848,12 @@ app.post('/webhook', async (req, res) => {
                   await sendMakeupMenu({ client, to: m.from, userId: sender.id });
                   localHandled = true;
                 } else if (choice === 'credits') {
-                  const { rows } = await client.query(
-                    'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
-                    [sender.id]
-                  );
+                  await sendCreditsInfoAndFollowup({
+                    client,
+                    to: m.from,
+                    userId: sender.id
+                  });  
+                  localHandled = true;
                   const bal = rows[0]?.balance || 0;
                     await sendText({
                       to: m.from,
