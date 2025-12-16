@@ -354,7 +354,7 @@ async function sendMainMenu({ to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: '${emoji} Witaj ponownie!\n\nWybierz, co chcesz zrobić 👇'
+        text: '${getSeasonEmoji()} Witaj ponownie!\n\nWybierz, co chcesz zrobić 👇'
       },
       action: {
         button: '📋 Otwórz menu',
