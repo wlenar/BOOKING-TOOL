@@ -381,6 +381,115 @@ async function sendMainMenu({ to, userId }) {
   }
 }
 
+async function sendCreditsInfoAndFollowup({ client, to, userId }) {
+  const { rows } = await client.query(
+    'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
+    [userId]
+  );
+  const bal = rows[0]?.balance || 0;
+
+  const toNorm = normalizeTo(to);
+
+  // podstawowa informacja o liczbie nieobecności
+  await sendText({
+    to: toNorm,
+    userId,
+    body: `Masz ${bal} nieobecności do odrobienia.`
+  });
+
+  // jeśli brak WA config – kończymy na samym tekście
+  if (!WA_TOKEN || !WA_PHONE_ID) return;
+
+  // brak kredytów → przyciski "Menu główne / Zakończ rozmowę"
+  if (bal <= 0) {
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: toNorm,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: {
+          text: 'Co chcesz zrobić dalej?'
+        },
+        action: {
+          buttons: [
+            {
+              type: 'reply',
+              reply: { id: 'no_credits_menu', title: '🏠 Menu główne' }
+            },
+            {
+              type: 'reply',
+              reply: { id: 'no_credits_end', title: '🏁 Zakończ rozmowę' }
+            }
+          ]
+        }
+      }
+    };
+
+    const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+    const bodyLog = 'NO_CREDITS_FOLLOWUP: [Menu główne] [Zakończ rozmowę]';
+    const waMessageId = res.data?.messages?.[0]?.id || null;
+    const status = res.ok ? 'sent' : 'error';
+    const reason = res.ok
+      ? null
+      : (res.status ? `http_${res.status}` : 'send_failed');
+
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: bodyLog,
+      messageType: 'interactive_buttons',
+      status,
+      reason,
+      waMessageId
+    });
+    return;
+  }
+
+  // są kredyty → przyciski "Wolne terminy / Menu"
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: {
+        text: 'Co chcesz zrobić dalej?'
+      },
+      action: {
+        buttons: [
+          {
+            type: 'reply',
+            reply: { id: 'credits_makeup', title: '🎯 Wolne terminy' }
+          },
+          {
+            type: 'reply',
+            reply: { id: 'credits_menu', title: '🏠 Menu' }
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+  const bodyLog = 'CREDITS_FOLLOWUP: [Wolne terminy] [Menu]';
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok
+    ? null
+    : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_buttons',
+    status,
+    reason,
+    waMessageId
+  });
+}
+
 async function sendUpcomingClassesMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
   const rows = await getUpcomingUserClasses(client, userId);
@@ -1382,19 +1491,15 @@ function parseAbsenceCommand(text) {
   if (!text) return null;
 
   const normalized = text.trim().toLowerCase();
-
-  // wariant 1: "zwalniam dd/mm"
   let m = normalized.match(
     /^zwalniam\s+(\d{1,2})[./-](\d{1,2})(?:\s+o\s+\d{1,2}[:.]\d{2})?$/
   );
 
-  // wariant 2: samo "dd/mm"
   if (!m) {
     m = normalized.match(
       /^(\d{1,2})[./-](\d{1,2})(?:\s+o\s+\d{1,2}[:.]\d{2})?$/
     );
   }
-
   if (!m) return null;
 
   const day = parseInt(m[1], 10);
@@ -1402,10 +1507,21 @@ function parseAbsenceCommand(text) {
   if (day < 1 || day > 31 || month < 1 || month > 12) return null;
 
   const now = new Date();
-  const year = now.getFullYear();
+  const thisYear = now.getFullYear();
 
   const dd = String(day).padStart(2, '0');
   const mm = String(month).padStart(2, '0');
+
+  const candidateThisYear = new Date(`${thisYear}-${mm}-${dd}T00:00:00`);
+  let year = thisYear;
+
+  // jeśli jesteśmy w grudniu, a wpisana data "cofa" nas >7 dni → zakładamy przyszły rok
+  if (
+    now.getMonth() === 11 && // grudzień (0-based)
+    candidateThisYear.getTime() + 7 * 24 * 60 * 60 * 1000 < now.getTime()
+  ) {
+    year = thisYear + 1;
+  }
 
   return { ymd: `${year}-${mm}-${dd}` };
 }
