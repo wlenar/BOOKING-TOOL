@@ -263,6 +263,36 @@ async function sendInstructorMenu({ to, instructorId }) {
     waMessageId
   });
 }
+// =========================
+// DYNAMICZNE EMOJI POWITANIA
+// =========================
+
+function getSeasonEmoji() {
+  const today = new Date();
+  const month = today.getMonth() + 1; // 1-12
+  const day = today.getDate();
+
+  // Święta Bożego Narodzenia
+  if (month === 12 && day >= 24 && day <= 26) return "🎄";
+
+  // Zima
+  if (month === 12 || month === 1 || month === 2) return "❄️";
+
+  // Wiosna
+  if (month >= 3 && month <= 5) return "🌱";
+
+  // Lato
+  if (month >= 6 && month <= 8) return "🌞";
+
+  // Wczesna jesień
+  if (month === 9 || month === 10) return "🍂";
+
+  // Późna jesień (listopad)
+  if (month === 11) return "🍁";
+
+  // Domyślnie
+  return "🌟";
+}
 
 // =========================
 // LISTA ZAJĘĆ UŻYTKOWNIKA (14 dni) + MENU ABSENCJI
@@ -315,6 +345,8 @@ async function sendMainMenu({ to, userId }) {
     return;
   }
 
+  const emoji = getSeasonEmoji();
+
   const payload = {
     messaging_product: 'whatsapp',
     to: toNorm,
@@ -322,7 +354,7 @@ async function sendMainMenu({ to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: '🍂 Witaj w studiu Pilates!\n\nWybierz, co chcesz zrobić 👇'
+        text: '${emoji} Witaj ponownie!\n\nWybierz, co chcesz zrobić 👇'
       },
       action: {
         button: '📋 Otwórz menu',
