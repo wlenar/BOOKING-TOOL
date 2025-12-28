@@ -34,10 +34,20 @@ const pool = new Pool(
 // UTILS
 // =========================
 function normalizeTo(to) { return String(to).replace(/^\+/, ''); }
+
 async function postWA({ phoneId, payload }) {
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
-  const headers = { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' };
-  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+  const headers = {
+    Authorization: `Bearer ${WA_TOKEN}`,
+    'Content-Type': 'application/json'
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload)
+  });
+
   const data = await resp.json().catch(() => ({}));
 
   if (!resp.ok) {
@@ -46,7 +56,7 @@ async function postWA({ phoneId, payload }) {
       to: payload?.to,
       type: payload?.type,
       interactiveType: payload?.interactive?.type,
-      error: data
+      data
     });
   }
 
@@ -365,7 +375,7 @@ async function sendMainMenu({ to, userId }) {
     interactive: {
       type: 'list',
       body: {
-        text: `${getSeasonEmoji()} Witaj w studiu Pilates!\n\nWybierz, co chcesz zrobić 👇`
+        text: `${emoji} Witaj w studiu Pilates!\n\nWybierz, co chcesz zrobić 👇`
       },
       action: {
         button: '📋 Otwórz menu',
@@ -809,7 +819,7 @@ async function sendMakeupMenu({ client, to, userId }) {
        AND e.class_template_id = os.class_template_id
       WHERE
             os.session_date >= current_date
-        AND os.session_date <  current_date + interval '7 days'
+        AND os.session_date <  current_date + interval '14 days'
         AND os.free_capacity_remaining > 0
         AND (os.required_level IS NULL OR os.required_level <= $2)
         AND (os.price_per_session IS NULL OR os.price_per_session <= $3)
@@ -831,11 +841,13 @@ async function sendMakeupMenu({ client, to, userId }) {
   );
 
   if (!rows || rows.length === 0) {
-    return sendText({
+    await sendText({
       to: toNorm,
       userId,
-      body: 'Aktualnie nie ma dostępnych wolnych miejsc do odrabiania w najbliższym tygodniu.'
+      body: 'Aktualnie nie ma dostępnych wolnych miejsc do odrabiania w najbliższych 14 dniach.'
     });
+    await sendMainMenu({ to: toNorm, userId });
+    return;
   }
 
   if (!WA_TOKEN || !WA_PHONE_ID) {
@@ -1904,14 +1916,7 @@ app.post('/webhook', async (req, res) => {
                     userId: sender.id
                   });  
                   localHandled = true;
-                  const bal = rows[0]?.balance || 0;
-                    await sendText({
-                      to: m.from,
-                      body: `Masz ${bal} nieobecności do odrobienia.`,
-                      userId: sender.id
-                    });
-
-                    localHandled = true;
+                  
                   } else if (choice === 'end') {
                     await sendText({
                       to: m.from,
