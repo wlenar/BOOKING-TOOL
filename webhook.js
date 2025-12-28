@@ -38,7 +38,19 @@ async function postWA({ phoneId, payload }) {
   const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
   const headers = { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' };
   const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
-  return { ok: resp.ok, status: resp.status, data: await resp.json().catch(() => ({})) };
+  const data = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    console.error('[WA][Graph] error sending message', {
+      status: resp.status,
+      to: payload?.to,
+      type: payload?.type,
+      interactiveType: payload?.interactive?.type,
+      error: data
+    });
+  }
+
+  return { ok: resp.ok, status: resp.status, data };
 }
 
 async function sendText({ to, body, userId = null }) {
@@ -2646,7 +2658,7 @@ if (WA_TOKEN && WA_PHONE_ID) {
     timezone: 'Europe/Warsaw'
   });
 
-  // nowy CRON: 25-go dnia miesiąca, 18:00
+  // nowy CRON: 22-go dnia miesiąca, 18:00
   cron.schedule('0 18 22 * *', () => sendPaymentReminderTemplate(), {
     timezone: 'Europe/Warsaw'
   });
