@@ -805,39 +805,11 @@ async function sendMakeupMenu({ client, to, userId }) {
 
   const { rows } = await client.query(
     `
-    WITH candidate_slots AS (
-      SELECT
-        os.session_date,
-        os.session_date_ymd,
-        os.session_time,
-        os.class_template_id,
-        os.group_name,
-        COUNT(*) AS open_slots
-      FROM public.v_open_slots_desc os
-      LEFT JOIN public.enrollments e
-        ON e.user_id = $1
-       AND e.class_template_id = os.class_template_id
-      WHERE
-            os.session_date >= current_date
-        AND os.session_date <  current_date + interval '14 days'
-        AND os.free_capacity_remaining > 0
-        AND (os.required_level IS NULL OR os.required_level <= $2)
-        AND (os.price_per_session IS NULL OR os.price_per_session <= $3)
-        AND e.user_id IS NULL
-      GROUP BY
-        os.session_date,
-        os.session_date_ymd,
-        os.session_time,
-        os.class_template_id,
-        os.group_name
-      HAVING COUNT(*) > 0
-    )
     SELECT *
-    FROM candidate_slots
-    ORDER BY session_date, session_time, group_name
+    FROM public.get_available_makeup_slots($1, $2)
     LIMIT 10
     `,
-    [userId, u.level_id, u.max_home_price]
+    [userId, 14]
   );
 
   if (!rows || rows.length === 0) {
@@ -878,7 +850,7 @@ async function sendMakeupMenu({ client, to, userId }) {
     return {
       id: `makeup_${iso}_${r.class_template_id}`,
       title,
-      ...(desc ? { description: desc.substring(0, 80) } : {})
+      ...(desc ? { description: desc.substring(0, 70) } : {})
     };
   });
 
@@ -945,17 +917,14 @@ async function runWeeklySlotsBroadcast() {
   }
 
   const client = await pool.connect();
+
   try {
     console.log('[CRON] weekly_slots_broadcast start');
 
-    // 1) przygotuj oferty w bazie
-    await client.query('SELECT public.job_prepare_weekly_slot_offers();');
-
-    // 2) pending oferty
-    const { rows } = await client.query(`
+    // 1) znajdź aktywnych użytkowników z dodatnimi kredytami
+    const { rows: users } = await client.query(`
       SELECT
-        so.id AS offer_id,
-        so.user_id,
+        u.id AS user_id,
         u.first_name,
         COALESCE(
           u.phone_e164,
@@ -965,73 +934,72 @@ async function runWeeklySlotsBroadcast() {
             ELSE NULL
           END
         ) AS phone,
-        os.slot_id,
-        os.class_template_id,
-        to_char(os.session_date, 'YYYY-MM-DD') AS session_date_ymd,
-        to_char(os.session_date, 'DD.MM')     AS session_date_label,
-        to_char(os.session_time, 'HH24:MI')   AS session_time_label,
-        os.group_name
-      FROM public.slot_offers so
-      JOIN public.users u
-        ON u.id = so.user_id
-        AND u.is_active = true
-      JOIN public.v_open_slots_desc os
-        ON os.slot_id = so.slot_id
+        COALESCE(c.balance, 0) AS credits
+      FROM public.users u
+      LEFT JOIN public.user_absence_credits c
+        ON c.user_id = u.id
       WHERE
-            so.status = 'pending'
-        AND os.session_date >= current_date
-        AND os.session_date <  current_date + interval '7 days'
-        AND os.free_capacity_remaining > 0
-      ORDER BY so.user_id, os.session_date, os.session_time, os.group_name
+        u.is_active = true
+        AND COALESCE(c.balance, 0) > 0
     `);
 
-    if (!rows.length) {
-      console.log('[CRON] weekly_slots_broadcast no pending offers');
-      return;
-    }
+    let processedUsers = 0;
 
-    // 3) grupowanie po user_id
-    const byUser = new Map();
-    for (const r of rows) {
-      if (!r.phone) continue;
-      if (!byUser.has(r.user_id)) {
-        byUser.set(r.user_id, {
-          userId: r.user_id,
-          firstName: r.first_name || '',
-          phone: r.phone,
-          offers: []
-        });
-      }
-      byUser.get(r.user_id).offers.push(r);
-    }
-
-    // 4) wysyłka per użytkownik
-    for (const u of byUser.values()) {
+    // 2) per-user – sloty z tej samej funkcji co w menu
+    for (const u of users) {
+      if (!u.phone) continue;
       const toNorm = normalizeTo(u.phone);
       if (!toNorm) continue;
 
+      const { rows: slots } = await client.query(
+        `
+        SELECT *
+        FROM public.get_available_makeup_slots($1, $2)
+        LIMIT 10
+        `,
+        [u.user_id, 7]     // broadcast: 7 dni do przodu
+      );
+
+      if (!slots || slots.length === 0) {
+        continue;
+      }
+
+      processedUsers++;
+
       const introBody =
         '🌿 Dostępne miejsca do odrabiania w tym tygodniu:\n' +
-        u.offers
-          .slice(0, 10)
-          .map(o => `${o.session_date_label} ${o.session_time_label} ${o.group_name}`)
+        slots
+          .map(o => `${o.session_date_ymd.slice(8,10)}.${o.session_date_ymd.slice(5,7)} ${o.session_time.toString().slice(0,5)} ${o.group_name}`)
           .join('\n') +
         '\n\nWybierz termin z listy, aby go zarezerwować.';
 
+      // 2a) tekst wprowadzający
       await sendText({
         to: toNorm,
         body: introBody,
-        userId: u.userId
+        userId: u.user_id
       });
 
-      const listOffers = u.offers.slice(0, 10);
+      // 2b) interaktywna lista z tymi samymi slotami
+      const listOffers = slots;
+
       if (!listOffers.length) continue;
 
-      const rowsList = listOffers.map(o => ({
-        id: `makeup_${o.session_date_ymd}_${o.class_template_id}`,
-        title: `${o.session_date_label} ${o.session_time_label}`.substring(0, 24),
-        description: (o.group_name || '').substring(0, 80)
-      }));
+      const rowsList = listOffers.map(o => {
+        const iso = String(o.session_date_ymd || '').slice(0, 10);
+        const [y, m, d] = iso.split('-');
+        const dateLabel = `${d}/${m}`;
+        const timeLabel = (o.session_time || '').toString().slice(0, 5);
+
+        let title = `${dateLabel} ${timeLabel}`;
+        if (title.length > 24) title = title.slice(0, 24);
+
+        return {
+          id: `makeup_${iso}_${o.class_template_id}`,
+          title,
+          description: (o.group_name || '').substring(0, 70)  // WA-safe
+        };
+      });
 
       const listPayload = {
         messaging_product: 'whatsapp',
@@ -1062,7 +1030,7 @@ async function runWeeklySlotsBroadcast() {
         : (listRes.status ? `http_${listRes.status}` : 'send_failed');
 
       await auditOutbound({
-        userId: u.userId,
+        userId: u.user_id,
         to: toNorm,
         body: 'WEEKLY_SLOTS_LIST: ' + rowsList.map(r => r.title).join(' | '),
         messageType: 'interactive_list',
@@ -1070,22 +1038,9 @@ async function runWeeklySlotsBroadcast() {
         reason: listReason,
         waMessageId: listWaMessageId
       });
-
-      const offerIds = listOffers.map(o => o.offer_id);
-      const newStatus = listRes.ok ? 'sent' : 'error';
-
-      await client.query(
-        `
-        UPDATE public.slot_offers
-           SET status = $2,
-               updated_at = now()
-         WHERE id = ANY($1::bigint[])
-        `,
-        [offerIds, newStatus]
-      );
     }
 
-    console.log('[CRON] weekly_slots_broadcast done, users:', byUser.size);
+    console.log(`[CRON] weekly_slots_broadcast done, users=${processedUsers}`);
   } catch (err) {
     console.error('[CRON] weekly_slots_broadcast error', err);
   } finally {
@@ -2375,7 +2330,7 @@ async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
     return {
       id: `instr_addslot_${iso}_${r.class_template_id}`,
       title,
-      description: r.group_name.substring(0,80)
+      description: r.group_name.substring(0,70)
     };
   });
 
