@@ -1662,13 +1662,19 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
           (info.user_first_name || '') +
           (info.user_last_name ? ` ${info.user_last_name}` : '');
         const who = userFullName.trim() || 'Klient';
-        const absLabel = info.session_date_label;
 
-        // TREŚĆ spójna z szablonem WhatsApp:
-        // "Cześć <imie>\n\n<imie1> zgłosił(a) nieobezność dnia <nieobecnosc>"
+        const timeLabel = info.start_time
+          ? info.start_time.toString().slice(0, 5)
+          : '';
+        const sessionLabel = timeLabel
+          ? `${info.session_date_label} ${timeLabel}`
+          : info.session_date_label;
+
+        // Treść spójna z nowym templatem:
+        // "Nowa zgłoszona nieobecność w Twojej grupie: {{1}}, data {{2}}, klient {{3}} Wolne miejsce zostało dodane do puli."
         const unifiedText =
-          `Cześć ${info.instr_first_name || 'Instruktorze'}\n\n` +
-          `${who} zgłosił(a) nieobezność dnia ${absLabel}`;
+          `Nowa zgłoszona nieobecność w Twojej grupie: ${info.group_name}, ` +
+          `data ${sessionLabel}, klient ${who} Wolne miejsce zostało dodane do puli.`;
 
         if (hasInteractionLast24h) {
           // mieliśmy kontakt <24h -> zwykły tekst
@@ -1697,8 +1703,7 @@ async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
 async function sendInstructorAbsenceTemplate({ info }) {
   const toNorm = normalizeTo(info.instr_phone);
 
-  // ⬇ PODMIEŃ nazwę szablonu na dokładną z Business Managera
-  const TEMPLATE_NAME = 'update_do_trenera';
+  const TEMPLATE_NAME = 'update_do_trenera_v2';
 
   if (!WA_TOKEN || !WA_PHONE_ID) {
     await auditOutbound({
@@ -1714,9 +1719,19 @@ async function sendInstructorAbsenceTemplate({ info }) {
     return { ok: false, reason: 'missing_config' };
   }
 
-  const userFullName = (info.user_first_name || '') +
+  const userFullName =
+    (info.user_first_name || '') +
     (info.user_last_name ? ` ${info.user_last_name}` : '');
   const who = userFullName.trim() || 'Klient';
+
+  const timeLabel = info.start_time
+    ? info.start_time.toString().slice(0, 5)
+    : '';
+  const sessionLabel = timeLabel
+    ? `${info.session_date_label} ${timeLabel}`
+    : info.session_date_label;
+
+  const className = info.group_name || 'Zajęcia';
 
   const payload = {
     messaging_product: 'whatsapp',
@@ -1729,12 +1744,12 @@ async function sendInstructorAbsenceTemplate({ info }) {
         {
           type: 'body',
           parameters: [
-            // {1} = imię instruktora
-            { type: 'text', text: info.instr_first_name || 'Instruktorze' },
-            // {2} = imię + nazwisko klienta
-            { type: 'text', text: who },
-            // {3} = data nieobecności, np. "12.11"
-            { type: 'text', text: info.session_date_label }
+            // {{1}} = nazwa zajęć
+            { type: 'text', text: className },
+            // {{2}} = data (np. "12.11 17:00")
+            { type: 'text', text: sessionLabel },
+            // {{3}} = imię + nazwisko klienta
+            { type: 'text', text: who }
           ]
         }
       ]
@@ -1755,9 +1770,9 @@ async function sendInstructorAbsenceTemplate({ info }) {
     body: `TEMPLATE: ${TEMPLATE_NAME}`,
     templateName: TEMPLATE_NAME,
     variables: JSON.stringify({
-      '{1}': info.instr_first_name || 'Instruktorze',
-      '{2}': who,
-      '{3}': info.session_date_label
+      '{1}': className,
+      '{2}': sessionLabel,
+      '{3}': who
     }),
     messageType: 'template',
     status,
@@ -1767,7 +1782,6 @@ async function sendInstructorAbsenceTemplate({ info }) {
 
   return res;
 }
-
 
 app.post('/webhook', async (req, res) => {
   if (DEBUG) {
