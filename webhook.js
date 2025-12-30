@@ -230,6 +230,26 @@ async function resolveSenderType(client, wa) {
   return { type: 'none' };
 }
 
+// --- helper: dzieci danego użytkownika (rodzica) ---
+async function getUserChildren(client, guardianUserId) {
+  const { rows } = await client.query(
+    `
+    SELECT
+      u.id,
+      u.first_name,
+      u.last_name
+    FROM public.user_guardians g
+    JOIN public.users u
+      ON u.id = g.child_user_id
+    WHERE g.guardian_user_id = $1
+      AND u.is_active = true
+    ORDER BY u.first_name, u.last_name
+    `,
+    [guardianUserId]
+  );
+  return rows;
+}
+
 async function sendInstructorMenu({ to, instructorId }) {
   const toNorm = normalizeTo(to);
 
@@ -438,6 +458,87 @@ async function sendMainMenu({ to, userId }) {
   }
 }
 
+// menu wyboru: czyja nieobecność (rodzic / dziecko)
+async function sendGuardianWhoMenu({ client, to, guardianUserId, context }) {
+  const toNorm = normalizeTo(to);
+
+  // tylko na razie: wspieramy context === 'absence'
+  if (context !== 'absence') {
+    return sendMainMenu({ to: toNorm, userId: guardianUserId });
+  }
+
+  const children = await getUserChildren(client, guardianUserId);
+
+  // brak dzieci -> fallback do dotychczasowego zachowania
+  if (!children.length) {
+    return sendUpcomingClassesMenu({ client, to: toNorm, userId: guardianUserId });
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: guardianUserId,
+      to: toNorm,
+      body: 'GUARDIAN_WHO_ABSENCE (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_buttons',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const buttons = [
+    {
+      type: 'reply',
+      reply: { id: 'who_absence_self', title: 'Moja nieobecność' }
+    },
+    ...children.map((c) => ({
+      type: 'reply',
+      reply: {
+        id: `who_absence_child_${c.id}`,
+        title: `Nieobecność: ${c.first_name || 'Dziecko'}`
+      }
+    }))
+  ];
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: {
+        text: 'Kogo nieobecność chcesz zgłosić?'
+      },
+      action: {
+        buttons
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+  const bodyLog =
+    'GUARDIAN_WHO_ABSENCE: ' +
+    buttons.map((b) => b.reply.title).join(' | ');
+
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok
+    ? null
+    : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId: guardianUserId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_buttons',
+    status,
+    reason,
+    waMessageId
+  });
+
+  return res;
+}
+
 async function sendCreditsInfoAndFollowup({ client, to, userId }) {
   const { rows } = await client.query(
     'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
@@ -587,8 +688,8 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
         title = title.slice(0, 24);
       }
 
-      const id = `absence_${iso}_${row.class_template_id}`;
-      return { id, title };
+      const id = `absence_${userId}_${iso}_${row.class_template_id}`;
+      return { id, title }
     });
 
   const payload = {
@@ -1067,11 +1168,56 @@ async function handleAbsenceInteractive({ client, m, sender }) {
       return true;
     }
 
-    const parts = id.split('_'); // absence_YYYY-MM-DD_classTemplateId
+    const parts = id.split('_'); // nowy: absence_userId_YYYY-MM-DD_classTemplateId  lub stary: absence_YYYY-MM-DD_classTemplateId
     if (parts.length < 3) return false;
 
-    const ymd = parts[1];
-    const classTemplateId = Number(parts[2]) || null;
+    let actingUserId;
+    let ymd;
+    let classTemplateId;
+
+    if (parts.length === 4) {
+      // nowy format: absence_userId_YYYY-MM-DD_classTemplateId
+      actingUserId = Number(parts[1]) || 0;
+      ymd = parts[2];
+      classTemplateId = Number(parts[3]) || null;
+    } else {
+      // fallback na stary format: absence_YYYY-MM-DD_classTemplateId
+      actingUserId = sender.id;
+      ymd = parts[1];
+      classTemplateId = Number(parts[2]) || null;
+    }
+
+    if (!actingUserId || !classTemplateId) {
+      await sendText({
+        to: m.from,
+        body: 'Nie udało się rozpoznać wybranego terminu. Spróbuj proszę ponownie.',
+        userId: sender.id
+      });
+      return true;
+    }
+
+    // jeśli zgłasza rodzic dla dziecka -> upewnij się, że ma do tego prawo
+    if (actingUserId !== sender.id) {
+      const { rows: rel } = await client.query(
+        `
+        SELECT 1
+        FROM public.user_guardians
+        WHERE guardian_user_id = $1
+          AND child_user_id = $2
+        LIMIT 1
+        `,
+        [sender.id, actingUserId]
+      );
+
+      if (!rel.length) {
+        await sendText({
+          to: m.from,
+          body: 'Nie udało się potwierdzić uprawnień do zgłoszenia tej nieobecności.',
+          userId: sender.id
+        });
+        return true;
+      }
+    }
 
     // czy już jest absencja na ten dzień?
     const existing = await client.query(
@@ -1083,7 +1229,7 @@ async function handleAbsenceInteractive({ client, m, sender }) {
         AND session_date = $3::date
       LIMIT 1
       `,
-      [sender.id, classTemplateId, ymd]
+      [actingUserId, classTemplateId, ymd]
     );
 
     if (existing.rowCount > 0) {
@@ -1096,7 +1242,7 @@ async function handleAbsenceInteractive({ client, m, sender }) {
       return true;
     }
 
-    const result = await processAbsence(client, sender.id, ymd, classTemplateId);
+    const result = await processAbsence(client, actingUserId, ymd, classTemplateId);
 
     if (result.ok) {
       await sendText({
@@ -1339,7 +1485,24 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     const id = m.interactive.list_reply?.id || '';
 
     if (id === 'menu_absence') {
-      await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
+      const children = await getUserChildren(client, sender.id);
+
+      if (children.length > 0) {
+        // rodzic z dziećmi -> najpierw pytamy, kogo dotyczy
+        await sendGuardianWhoMenu({
+          client,
+          to: m.from,
+          guardianUserId: sender.id,
+          context: 'absence'
+        });
+      } else {
+        // brak dzieci -> stare zachowanie
+        await sendUpcomingClassesMenu({
+          client,
+          to: m.from,
+          userId: sender.id
+        });
+      }
       return true;
     }
 
@@ -1833,6 +1996,12 @@ app.post('/webhook', async (req, res) => {
             // najpierw panel instruktora (jeśli dotyczy)
             handled = await handleInstructorInteractive({ client, m, sender });
 
+            // potem wybór: czyja nieobecność (rodzic/dziecko)
+            if (!handled) {
+              handled = await handleGuardianWhoInteractive({ client, m, sender });
+            }
+
+            // dopiero potem standardowe menu użytkownika
             if (!handled) {
               handled = await handleMainMenuInteractive({ client, m, sender });
             }
@@ -2609,6 +2778,72 @@ async function handleInstructorInteractive({ client, m, sender }) {
   if (itype === 'button_reply') {
     // na razie brak przycisków w menu instruktora
     return false;
+  }
+
+  return false;
+}
+
+async function handleGuardianWhoInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'user' || !sender.active) return false;
+  if (m.type !== 'interactive' || m.interactive?.type !== 'button_reply') return false;
+
+  const replyId = m.interactive.button_reply?.id || '';
+  if (!replyId.startsWith('who_')) return false;
+
+  // who_absence_self  lub  who_absence_child_123
+  const parts = replyId.split('_');
+  if (parts.length < 3) return false;
+
+  const context = parts[1]; // 'absence'
+  let targetUserId = sender.id;
+
+  if (parts[2] === 'self') {
+    targetUserId = sender.id;
+  } else if (parts[2] === 'child') {
+    const childId = Number(parts[3]) || 0;
+    if (!childId) {
+      await sendText({
+        to: m.from,
+        body: 'Coś poszło nie tak przy wyborze osoby. Spróbuj ponownie.',
+        userId: sender.id
+      });
+      return true;
+    }
+
+    // walidacja relacji rodzic–dziecko
+    const { rows } = await client.query(
+      `
+      SELECT 1
+      FROM public.user_guardians
+      WHERE guardian_user_id = $1
+        AND child_user_id = $2
+      LIMIT 1
+      `,
+      [sender.id, childId]
+    );
+
+    if (!rows.length) {
+      await sendText({
+        to: m.from,
+        body: 'Nie udało się potwierdzić uprawnień do zarządzania tym kontem.',
+        userId: sender.id
+      });
+      return true;
+    }
+
+    targetUserId = childId;
+  } else {
+    return false;
+  }
+
+  // na razie obsługujemy tylko nieobecności
+  if (context === 'absence') {
+    await sendUpcomingClassesMenu({
+      client,
+      to: m.from,
+      userId: targetUserId
+    });
+    return true;
   }
 
   return false;
