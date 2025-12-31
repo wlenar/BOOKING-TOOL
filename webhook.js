@@ -804,6 +804,81 @@ async function sendWhoAbsenceMenu({ client, to, guardianUserId }) {
   return res;
 }
 
+async function sendGuardianWhoMenu({ client, to, guardianUserId, context }) {
+  const toNorm = normalizeTo(to);
+
+  // jeśli kiedyś zechcesz ujednolicić absences też tym wrapperem:
+  if (context === 'absence') {
+    return sendWhoAbsenceMenu({ client, to: toNorm, guardianUserId });
+  }
+
+  if (context !== 'makeup') {
+    // fallback
+    return sendMainMenu({ to: toNorm, userId: guardianUserId });
+  }
+
+  const children = await getUserChildren(client, guardianUserId);
+
+  // brak dzieci -> stare zachowanie
+  if (!children || children.length === 0) {
+    return sendMakeupMenu({ client, to: toNorm, userId: guardianUserId });
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: guardianUserId,
+      to: toNorm,
+      body: 'WHO_MAKEUP (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_buttons',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  // WA: max 3 przyciski, title max 20
+  const buttons = [
+    { type: 'reply', reply: { id: 'who_makeup_self', title: 'Moje' } },
+    ...children.slice(0, 2).map((c) => {
+      const nm = ((c.first_name || 'Dziecko') + '').trim().slice(0, 20);
+      return {
+        type: 'reply',
+        reply: { id: `who_makeup_child_${c.id}`, title: nm }
+      };
+    })
+  ];
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: 'Kogo dotyczy odrabianie?' },
+      action: { buttons }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog = 'WHO_MAKEUP: ' + buttons.map((b) => `[${b.reply.title}]`).join(' ');
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId: guardianUserId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_buttons',
+    status,
+    reason,
+    waMessageId
+  });
+
+  return res;
+}
+
 async function sendMakeupMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
 
@@ -936,7 +1011,7 @@ async function sendMakeupMenu({ client, to, userId }) {
     const desc = r.group_name || '';
 
     return {
-      id: `makeup_${iso}_${r.class_template_id}`,
+      id: `makeup_${userId}_${iso}_${r.class_template_id}`,
       title,
       ...(desc ? { description: desc.substring(0, 70) } : {})
     };
@@ -1307,6 +1382,57 @@ async function handleWhoAbsenceInteractive({ client, m, sender }) {
   return false;
 }
 
+async function handleGuardianWhoInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'user' || !sender.active) return false;
+  if (m.type !== 'interactive' || m.interactive?.type !== 'button_reply') return false;
+
+  const id = m.interactive.button_reply?.id || '';
+  if (!id.startsWith('who_makeup_')) return false;
+
+  if (id === 'who_makeup_self') {
+    await sendMakeupMenu({ client, to: m.from, userId: sender.id });
+    return true;
+  }
+
+  if (id.startsWith('who_makeup_child_')) {
+    const childId = Number(id.split('_')[3]) || 0;
+
+    if (!childId) {
+      await sendText({
+        to: m.from,
+        body: 'Nie udało się rozpoznać dziecka. Spróbuj ponownie.',
+        userId: sender.id
+      });
+      return true;
+    }
+
+    const { rowCount } = await client.query(
+      `
+      SELECT 1
+      FROM public.user_guardians
+      WHERE guardian_user_id = $1
+        AND child_user_id = $2
+      LIMIT 1
+      `,
+      [sender.id, childId]
+    );
+
+    if (!rowCount) {
+      await sendText({
+        to: m.from,
+        body: 'Brak uprawnień do zarządzania tym kontem.',
+        userId: sender.id
+      });
+      return true;
+    }
+
+    await sendMakeupMenu({ client, to: m.from, userId: childId });
+    return true;
+  }
+
+  return false;
+}
+
 async function handleMakeupInteractive({ client, m, sender }) {
   if (!sender || sender.type !== 'user' || !sender.active) return false;
   if (m.type !== 'interactive' || m.interactive?.type !== 'list_reply') return false;
@@ -1315,9 +1441,22 @@ async function handleMakeupInteractive({ client, m, sender }) {
   const id = reply?.id || '';
   if (!id.startsWith('makeup_')) return false;
 
-  // format: makeup_YYYY-MM-DD_classTemplateId
+  // nowy: makeup_userId_YYYY-MM-DD_classTemplateId  | stary: makeup_YYYY-MM-DD_classTemplateId
   const parts = id.split('_');
-  if (parts.length !== 3) {
+
+  let actingUserId;
+  let sessionYmd;
+  let classTemplateId;
+
+  if (parts.length === 4) {
+    actingUserId = Number(parts[1]) || 0;
+    sessionYmd = parts[2];
+    classTemplateId = parseInt(parts[3], 10);
+  } else if (parts.length === 3) {
+    actingUserId = sender.id; // fallback
+    sessionYmd = parts[1];
+    classTemplateId = parseInt(parts[2], 10);
+  } else {
     await sendText({
       to: m.from,
       userId: sender.id,
@@ -1326,9 +1465,7 @@ async function handleMakeupInteractive({ client, m, sender }) {
     return true;
   }
 
-  const sessionYmd = parts[1];
-  const classTemplateId = parseInt(parts[2], 10);
-  if (!classTemplateId || Number.isNaN(classTemplateId)) {
+  if (!actingUserId || !classTemplateId || Number.isNaN(classTemplateId)) {
     await sendText({
       to: m.from,
       userId: sender.id,
@@ -1337,7 +1474,30 @@ async function handleMakeupInteractive({ client, m, sender }) {
     return true;
   }
 
-  const userId = sender.id;
+  // jeśli rodzic działa na dziecku -> walidacja relacji
+  if (actingUserId !== sender.id) {
+    const { rowCount } = await client.query(
+      `
+      SELECT 1
+      FROM public.user_guardians
+      WHERE guardian_user_id = $1
+        AND child_user_id = $2
+      LIMIT 1
+      `,
+      [sender.id, actingUserId]
+    );
+
+    if (!rowCount) {
+      await sendText({
+        to: m.from,
+        userId: sender.id,
+        body: 'Brak uprawnień do zarządzania tym kontem.'
+      });
+      return true;
+    }
+  }
+
+  const userId = actingUserId;
   const to = m.from;
 
   try {
@@ -1489,7 +1649,18 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     }
 
     if (id === 'menu_makeup') {
-      await sendMakeupMenu({ client, to: m.from, userId: sender.id });
+      const children = await getUserChildren(client, sender.id);
+
+      if (children.length > 0) {
+        await sendGuardianWhoMenu({
+          client,
+          to: m.from,
+          guardianUserId: sender.id,
+          context: 'makeup'
+        });
+      } else {
+        await sendMakeupMenu({ client, to: m.from, userId: sender.id });
+      }
       return true;
     }
 
@@ -1983,6 +2154,10 @@ app.post('/webhook', async (req, res) => {
             if (!handled) {
               handled = await handleWhoAbsenceInteractive({ client, m, sender });
             }
+            
+            if (!handled) {
+              handled = await handleGuardianWhoInteractive({ client, m, sender });
+            }
 
             if (!handled) {
               handled = await handleMainMenuInteractive({ client, m, sender });
@@ -2033,8 +2208,19 @@ app.post('/webhook', async (req, res) => {
                   localHandled = true;
 
                 } else if (choice === 'makeup') {
-                  await sendMakeupMenu({ client, to: m.from, userId: sender.id });
-                  localHandled = true;
+                  const children = await getUserChildren(client, sender.id);
+
+                  if (children.length > 0) {
+                    await sendGuardianWhoMenu({
+                      client,
+                      to: m.from,
+                      guardianUserId: sender.id,
+                      context: 'makeup'
+                    });
+                  } else {
+                    await sendMakeupMenu({ client, to: m.from, userId: sender.id });
+                  }
+                localHandled = true;
                   
                 } else if (choice === 'credits') {
                   await sendCreditsInfoAndFollowup({
