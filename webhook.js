@@ -406,7 +406,7 @@ async function sendUpcomingClassesMenu({ client, to, userId }) {
         title = title.slice(0, 24);
       }
 
-      const id = `absence_${iso}_${row.class_template_id}`;
+      const id = `absence_${userId}_${iso}_${row.class_template_id}`;
       return { id, title };
     });
 
@@ -1236,12 +1236,52 @@ async function handleAbsenceInteractive({ client, m, sender }) {
       });
       return true;
     }
-
-    const parts = id.split('_'); // absence_YYYY-MM-DD_classTemplateId
+    // nowy: absence_userId_YYYY-MM-DD_classTemplateId  | stary: absence_YYYY-MM-DD_classTemplateId
+    const parts = id.split('_');
     if (parts.length < 3) return false;
 
-    const ymd = parts[1];
-    const classTemplateId = Number(parts[2]) || null;
+    let actingUserId;
+    let ymd;
+    let classTemplateId;
+
+    if (parts.length === 4) {
+      actingUserId = Number(parts[1]) || 0;
+      ymd = parts[2];
+      classTemplateId = Number(parts[3]) || null;
+    } else if (parts.length === 3) {
+      // fallback na stary format
+      actingUserId = sender.id;
+      ymd = parts[1];
+      classTemplateId = Number(parts[2]) || null;
+    } else {
+      return false;
+    }
+
+    if (!actingUserId || !classTemplateId) return false;
+
+    // jeśli rodzic działa na dziecku -> walidacja relacji
+    if (actingUserId !== sender.id) {
+      const { rowCount } = await client.query(
+        `
+        SELECT 1
+        FROM public.user_guardians
+        WHERE guardian_user_id = $1
+          AND child_user_id = $2
+        LIMIT 1
+        `,
+        [sender.id, actingUserId]
+      );
+
+      if (!rowCount) {
+        await sendText({
+          to: m.from,
+          body: 'Brak uprawnień do zarządzania tym kontem.',
+          userId: sender.id
+        });
+        return true;
+      }
+    }
+
 
     // czy już jest absencja na ten dzień?
     const existing = await client.query(
@@ -1253,7 +1293,7 @@ async function handleAbsenceInteractive({ client, m, sender }) {
         AND session_date = $3::date
       LIMIT 1
       `,
-      [sender.id, classTemplateId, ymd]
+      [actingUserId, classTemplateId, ymd]
     );
 
     if (existing.rowCount > 0) {
@@ -1266,7 +1306,7 @@ async function handleAbsenceInteractive({ client, m, sender }) {
       return true;
     }
 
-    const result = await processAbsence(client, sender.id, ymd, classTemplateId);
+    const result = await processAbsence(client, actingUserId, ymd, classTemplateId);
 
     if (result.ok) {
       await sendText({
