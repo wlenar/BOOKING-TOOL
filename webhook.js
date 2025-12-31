@@ -366,6 +366,93 @@ async function getUpcomingUserClasses(client, userId) {
   return res.rows;
 }
 
+async function sendUpcomingClassesMenu({ client, to, userId }) {
+  const toNorm = normalizeTo(to);
+
+  const classes = await getUpcomingUserClasses(client, userId);
+
+  // brak zajęć -> tekst + powrót do menu
+  if (!classes || classes.length === 0) {
+    await sendText({
+      to: toNorm,
+      userId,
+      body: 'Nie widzę Twoich zajęć w najbliższych 14 dniach.'
+    });
+    await sendMainMenu({ to: toNorm, userId });
+    return true;
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: 'UPCOMING_CLASSES (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_list',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const rows = classes.slice(0, 9).map((r) => {
+    const iso = String(r.session_date).slice(0, 10);
+    const [y, m, d] = iso.split('-');
+    const dateLabel = `${d}/${m}`;
+    const timeLabel = (r.start_time || '').toString().slice(0, 5);
+
+    let title = `${dateLabel} ${timeLabel}`;
+    if (title.length > 24) title = title.slice(0, 24);
+
+    const desc = r.group_name || '';
+
+    return {
+      // UWAGA: na razie stary format (żeby działało od razu)
+      id: `absence_${iso}_${r.class_template_id}`,
+      title,
+      ...(desc ? { description: desc.substring(0, 70) } : {})
+    };
+  });
+
+  rows.push({
+    id: 'absence_other_date',
+    title: 'Inny termin…',
+    description: 'Wpisz: "Zwalniam dd/mm"'
+  });
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: { text: 'Wybierz zajęcia, które chcesz zwolnić:' },
+      action: {
+        button: 'Wybierz termin',
+        sections: [{ title: 'Twoje zajęcia', rows }]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog = 'UPCOMING_CLASSES: ' + rows.map(r => r.title).join(' | ');
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_list',
+    status,
+    reason,
+    waMessageId
+  });
+
+  return res;
+}
+
 async function sendMainMenu({ to, userId }) {
   const toNorm = normalizeTo(to);
 
