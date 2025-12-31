@@ -454,45 +454,64 @@ async function sendMainMenu({ to, userId }) {
 }
 
 async function sendCreditsInfoAndFollowup({ client, to, userId }) {
-  const { rows } = await client.query(
-    'SELECT balance FROM public.user_absence_credits WHERE user_id = $1',
-    [userId]
-  );
-  const bal = rows[0]?.balance || 0;
-
   const toNorm = normalizeTo(to);
 
-  // podstawowa informacja o liczbie nieobecności
-  await sendText({
-    to: toNorm,
-    userId,
-    body: `Masz ${bal} nieobecności do odrobienia.`
-  });
+  const children = await getUserChildren(client, userId);
+  const childIds = (children || []).map(c => c.id);
+
+  const ids = [userId, ...childIds];
+
+  // pobierz salda dla rodzica + dzieci
+  const { rows } = await client.query(
+    `
+    SELECT u.id, u.first_name, COALESCE(c.balance, 0) AS balance
+    FROM public.users u
+    LEFT JOIN public.user_absence_credits c
+      ON c.user_id = u.id
+    WHERE u.id = ANY($1::int[])
+    ORDER BY (u.id = $2) DESC, u.first_name NULLS LAST, u.id
+    `,
+    [ids, userId]
+  );
+
+  const total = rows.reduce((acc, r) => acc + Number(r.balance || 0), 0);
+
+  // tekst: jeśli ma dzieci -> pokazujemy sumę + rozbicie
+  if (childIds.length > 0) {
+    const lines = rows.map(r => {
+      const who = (r.id === userId) ? 'Ty' : ((r.first_name || 'Dziecko').trim());
+      return `• ${who}: ${r.balance}`;
+    });
+
+    await sendText({
+      to: toNorm,
+      userId,
+      body: `Łącznie macie ${total} nieobecności do odrobienia.\n` + lines.join('\n')
+    });
+  } else {
+    await sendText({
+      to: toNorm,
+      userId,
+      body: `Masz ${total} nieobecności do odrobienia.`
+    });
+  }
 
   // jeśli brak WA config – kończymy na samym tekście
   if (!WA_TOKEN || !WA_PHONE_ID) return;
 
   // brak kredytów → przyciski "Menu główne / Zakończ rozmowę"
-  if (bal <= 0) {
+  if (total <= 0) {
     const payload = {
       messaging_product: 'whatsapp',
       to: toNorm,
       type: 'interactive',
       interactive: {
         type: 'button',
-        body: {
-          text: 'Co chcesz zrobić dalej?'
-        },
+        body: { text: 'Co chcesz zrobić dalej?' },
         action: {
           buttons: [
-            {
-              type: 'reply',
-              reply: { id: 'no_credits_menu', title: '🏠 Menu główne' }
-            },
-            {
-              type: 'reply',
-              reply: { id: 'no_credits_end', title: '🏁 Zakończ rozmowę' }
-            }
+            { type: 'reply', reply: { id: 'no_credits_menu', title: '🏠 Menu główne' } },
+            { type: 'reply', reply: { id: 'no_credits_end', title: '🏁 Zakończ rozmowę' } }
           ]
         }
       }
@@ -502,9 +521,7 @@ async function sendCreditsInfoAndFollowup({ client, to, userId }) {
     const bodyLog = 'NO_CREDITS_FOLLOWUP: [Menu główne] [Zakończ rozmowę]';
     const waMessageId = res.data?.messages?.[0]?.id || null;
     const status = res.ok ? 'sent' : 'error';
-    const reason = res.ok
-      ? null
-      : (res.status ? `http_${res.status}` : 'send_failed');
+    const reason = res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed');
 
     await auditOutbound({
       userId,
@@ -525,31 +542,21 @@ async function sendCreditsInfoAndFollowup({ client, to, userId }) {
     type: 'interactive',
     interactive: {
       type: 'button',
-      body: {
-        text: 'Co chcesz zrobić dalej?'
-      },
+      body: { text: 'Co chcesz zrobić dalej?' },
       action: {
         buttons: [
-          {
-            type: 'reply',
-            reply: { id: 'credits_makeup', title: '🎯 Wolne terminy' }
-          },
-          {
-            type: 'reply',
-            reply: { id: 'credits_menu', title: '🏠 Menu' }
-          }
+          { type: 'reply', reply: { id: 'credits_makeup', title: '📅 Wolne terminy' } },
+          { type: 'reply', reply: { id: 'credits_menu', title: '🏠 Menu główne' } }
         ]
       }
     }
   };
 
   const res = await postWA({ phoneId: WA_PHONE_ID, payload });
-  const bodyLog = 'CREDITS_FOLLOWUP: [Wolne terminy] [Menu]';
+  const bodyLog = 'CREDITS_FOLLOWUP: [Wolne terminy] [Menu główne]';
   const waMessageId = res.data?.messages?.[0]?.id || null;
   const status = res.ok ? 'sent' : 'error';
-  const reason = res.ok
-    ? null
-    : (res.status ? `http_${res.status}` : 'send_failed');
+  const reason = res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed');
 
   await auditOutbound({
     userId,
@@ -560,113 +567,6 @@ async function sendCreditsInfoAndFollowup({ client, to, userId }) {
     reason,
     waMessageId
   });
-}
-
-async function sendUpcomingClassesMenu({ client, to, userId }) {
-  const toNorm = normalizeTo(to);
-  const rows = await getUpcomingUserClasses(client, userId);
-
-  if (!rows || rows.length === 0) {
-    return sendText({
-      to: toNorm,
-      body: 'W najbliższych 14 dniach nie masz zaplanowanych zajęć.',
-      userId
-    });
-  }
-
-  if (!WA_TOKEN || !WA_PHONE_ID) {
-    await auditOutbound({
-      userId,
-      to: toNorm,
-      body: 'MENU_14_DNI (brak konfiguracji WhatsApp API)',
-      messageType: 'interactive_list',
-      status: 'skipped',
-      reason: 'missing_config'
-    });
-    return { ok: false, reason: 'missing_config' };
-  }
-
-  const sectionRows = rows
-    .slice(0, 10)
-    .map((row) => {
-      const rawDate = row.session_date;
-      const iso = rawDate instanceof Date
-        ? rawDate.toISOString().slice(0, 10)
-        : String(rawDate).slice(0, 10); // YYYY-MM-DD
-
-      const [y, m, d] = iso.split('-');
-      const yy = y.slice(2, 4);
-
-      let title = `${d}/${m}/${yy} ${row.group_name}`;
-      if (title.length > 24) {
-        title = title.slice(0, 24);
-      }
-
-      const id = `absence_${iso}_${row.class_template_id}`;
-      return { id, title };
-    });
-
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: toNorm,
-    type: 'interactive',
-    interactive: {
-      type: 'list',
-      body: {
-        text: '📅 Wybierz zajęcia, które chcesz zwolnić:'
-      },
-      action: {
-        button: '🗓️ Wybierz termin',
-        sections: [
-          {
-            title: 'Twoje najbliższe zajęcia',
-            rows: sectionRows
-          },
-          {
-            title: 'Inne opcje',
-            rows: [
-              {
-                id: 'absence_other_date',
-                title: '📆 Inny termin',
-                description: 'Podam datę w wiadomości'
-              }
-            ]
-          }
-        ]
-      }
-    }
-  };
-
-  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
-
-  const bodyLog =
-    'MENU_14_DNI: ' +
-    sectionRows.map(r => r.title).join(' | ') +
-    ' | Inny termin';
-
-  if (res.ok) {
-    const waMessageId = res.data?.messages?.[0]?.id || null;
-    await auditOutbound({
-      userId,
-      to: toNorm,
-      body: bodyLog,
-      messageType: 'interactive_list',
-      status: 'sent',
-      waMessageId
-    });
-  } else {
-    const reason = res.status ? `http_${res.status}` : 'send_failed';
-    await auditOutbound({
-      userId,
-      to: toNorm,
-      body: bodyLog,
-      messageType: 'interactive_list',
-      status: 'error',
-      reason
-    });
-  }
-
-  return res;
 }
 
 async function sendAbsenceMoreQuestion({ to, userId }) {
@@ -1689,7 +1589,18 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     const replyId = m.interactive.button_reply?.id || '';
 
     if (replyId === 'credits_makeup') {
-      await sendMakeupMenu({ client, to: m.from, userId: sender.id });
+      const children = await getUserChildren(client, sender.id);
+
+      if (children.length > 0) {
+        await sendGuardianWhoMenu({
+          client,
+          to: m.from,
+          guardianUserId: sender.id,
+          context: 'makeup'
+        });
+      } else {
+        await sendMakeupMenu({ client, to: m.from, userId: sender.id });
+      }
       return true;
     }
 
