@@ -1313,24 +1313,24 @@ async function handleAbsenceInteractive({ client, m, sender }) {
 
       let whoLabel = 'Twoją';
       if (isChild) {
-        const { rows } = await client.query(
+        const childRes = await client.query(
           `SELECT first_name FROM public.users WHERE id = $1 LIMIT 1`,
-        [actingUserId]
-      );
-      const childName = rows[0]?.first_name;
-      whoLabel = childName ? `dziecka (${childName})` : 'dziecka';
-    }
+          [actingUserId]
+        );
+        const childName = childRes.rows[0]?.first_name;
+        whoLabel = childName ? `dziecka (${childName})` : 'dziecka';
+      }
 
-    await sendText({
-      to: m.from,
-      userId: sender.id,
-      body: `✅ Zgłoszono nieobecność ${whoLabel} na ${ymd}.`
-    });
-    
+      await sendText({
+        to: m.from,
+        userId: sender.id,
+        body: `✅ Zgłoszono nieobecność ${whoLabel} na ${ymd}.`
+      });
+
       await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
       return true;
     }
-    
+
     if (result.reason === 'already_absent') {
       await sendText({
         to: m.from,
