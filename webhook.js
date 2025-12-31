@@ -1165,7 +1165,7 @@ async function runWeeklySlotsBroadcast() {
         if (title.length > 24) title = title.slice(0, 24);
 
         return {
-          id: `makeup_${iso}_${o.class_template_id}`,
+          id: `makeup_${u.user_id}_${iso}_${o.class_template_id}`,
           title,
           description: (o.group_name || '').substring(0, 70)  // WA-safe
         };
@@ -1309,11 +1309,24 @@ async function handleAbsenceInteractive({ client, m, sender }) {
     const result = await processAbsence(client, actingUserId, ymd, classTemplateId);
 
     if (result.ok) {
-      await sendText({
-        to: m.from,
-        body: `✅ Zgłoszono Twoją nieobecność ${ymd}. Miejsce zostało zwolnione.`,
-        userId: sender.id
-      });
+      const isChild = actingUserId !== sender.id;
+
+      let whoLabel = 'Twoją';
+      if (isChild) {
+        const { rows } = await client.query(
+          `SELECT first_name FROM public.users WHERE id = $1 LIMIT 1`,
+        [actingUserId]
+      );
+      const childName = rows[0]?.first_name;
+      whoLabel = childName ? `dziecka (${childName})` : 'dziecka';
+    }
+
+    await sendText({
+      to: m.from,
+      userId: sender.id,
+      body: `✅ Zgłoszono nieobecność ${whoLabel} na ${ymd}.`
+    });
+    
       await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
       return true;
     }
@@ -2220,10 +2233,6 @@ app.post('/webhook', async (req, res) => {
             if (!handled) {
               handled = await handleMainMenuInteractive({ client, m, sender });
             }
-
-            if (!handled) {
-              handled = await handleMainMenuInteractive({ client, m, sender });
-            }
             if (!handled) {
               handled = await handleMakeupInteractive({ client, m, sender });
             }
@@ -2261,7 +2270,6 @@ app.post('/webhook', async (req, res) => {
                 const choice = parseMainMenuChoice(m.text.body);
                 
                 if (choice === 'absence') {
-                  const kids = await getUserChildren(client, sender.id);
                   await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
                   localHandled = true;
 
@@ -3039,7 +3047,7 @@ if (WA_TOKEN && WA_PHONE_ID) {
     timezone: 'Europe/Warsaw'
   });
 
-  console.log('[CRON] Scheduled weekly_slots (Sun 10:30), absence_reminder (Sun 18:00), weekly_slots_broadcast (Sun 20:00), payment_reminder (25th 18:00)');
+  console.log('[CRON] Scheduled weekly_slots (Sun 10:30), absence_reminder (Sun 18:00), weekly_slots_broadcast (Sun 20:00), payment_reminder (22gi 18:00)');
 } else {
   console.log('[CRON] Skipping CRON scheduling (missing WA config)');
 }
