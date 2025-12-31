@@ -731,6 +731,79 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
   return res;
 }
 
+async function sendWhoAbsenceMenu({ client, to, guardianUserId }) {
+  const toNorm = normalizeTo(to);
+
+  const children = await getUserChildren(client, guardianUserId);
+
+  // brak dzieci -> stare zachowanie
+  if (!children || children.length === 0) {
+    return sendUpcomingClassesMenu({ client, to: toNorm, userId: guardianUserId });
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: guardianUserId,
+      to: toNorm,
+      body: 'WHO_ABSENCE (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_buttons',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  // WA: max 3 przyciski, title max 20 znaków
+  const buttons = [
+    {
+      type: 'reply',
+      reply: { id: 'who_absence_self', title: 'Moja' }
+    },
+    ...children.slice(0, 2).map((c) => {
+      const nm = ((c.first_name || 'Dziecko') + '').trim();
+      return {
+        type: 'reply',
+        reply: {
+          id: `who_absence_child_${c.id}`,
+          title: nm.slice(0, 20)
+        }
+      };
+    })
+  ];
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: {
+        text: 'Kogo dotyczy nieobecność?'
+      },
+      action: { buttons }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+
+  const bodyLog = 'WHO_ABSENCE: ' + buttons.map((b) => `[${b.reply.title}]`).join(' ');
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+  const status = res.ok ? 'sent' : 'error';
+  const reason = res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed');
+
+  await auditOutbound({
+    userId: guardianUserId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_buttons',
+    status,
+    reason,
+    waMessageId
+  });
+
+  return res;
+}
+
 async function sendMakeupMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
 
@@ -1179,6 +1252,61 @@ async function handleAbsenceInteractive({ client, m, sender }) {
   return false;
 }
 
+async function handleWhoAbsenceInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'user' || !sender.active) return false;
+  if (m.type !== 'interactive') return false;
+  if (m.interactive?.type !== 'button_reply') return false;
+
+  const id = m.interactive.button_reply?.id || '';
+  if (!id.startsWith('who_absence_')) return false;
+
+  // self
+  if (id === 'who_absence_self') {
+    await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
+    return true;
+  }
+
+  // child
+  if (id.startsWith('who_absence_child_')) {
+    const childId = Number(id.split('_')[3]) || 0;
+
+    if (!childId) {
+      await sendText({
+        to: m.from,
+        body: 'Nie udało się rozpoznać dziecka. Spróbuj ponownie.',
+        userId: sender.id
+      });
+      return true;
+    }
+
+    // walidacja relacji rodzic–dziecko
+    const { rowCount } = await client.query(
+      `
+      SELECT 1
+      FROM public.user_guardians
+      WHERE guardian_user_id = $1
+        AND child_user_id = $2
+      LIMIT 1
+      `,
+      [sender.id, childId]
+    );
+
+    if (!rowCount) {
+      await sendText({
+        to: m.from,
+        body: 'Brak uprawnień do zarządzania tym kontem.',
+        userId: sender.id
+      });
+      return true;
+    }
+
+    await sendUpcomingClassesMenu({ client, to: m.from, userId: childId });
+    return true;
+  }
+
+  return false;
+}
+
 async function handleMakeupInteractive({ client, m, sender }) {
   if (!sender || sender.type !== 'user' || !sender.active) return false;
   if (m.type !== 'interactive' || m.interactive?.type !== 'list_reply') return false;
@@ -1364,8 +1492,8 @@ async function handleMainMenuInteractive({ client, m, sender }) {
         userId: sender.id
       });
 
-      await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
-      return true;
+      await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
+      return true;;
     }
 
     if (id === 'menu_makeup') {
@@ -1808,6 +1936,8 @@ async function sendInstructorAbsenceTemplate({ info }) {
   return res;
 }
 
+
+
 app.post('/webhook', async (req, res) => {
   if (DEBUG) {
     console.log('[WEBHOOK] incoming hit');
@@ -1859,6 +1989,14 @@ app.post('/webhook', async (req, res) => {
             handled = await handleInstructorInteractive({ client, m, sender });
 
             if (!handled) {
+              handled = await handleWhoAbsenceInteractive({ client, m, sender });
+            }
+
+            if (!handled) {
+              handled = await handleMainMenuInteractive({ client, m, sender });
+            }
+
+            if (!handled) {
               handled = await handleMainMenuInteractive({ client, m, sender });
             }
             if (!handled) {
@@ -1907,7 +2045,7 @@ app.post('/webhook', async (req, res) => {
                       : `TEST: guardian NIE (dzieci=0)`,
                     userId: sender.id
                 });
-                await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
+                await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
                 localHandled = true;
 
                 } else if (choice === 'makeup') {
