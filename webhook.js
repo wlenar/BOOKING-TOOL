@@ -1484,14 +1484,6 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     if (id === 'menu_absence') {
       const kids = await getUserChildren(client, sender.id);
 
-      await sendText({
-        to: m.from,
-        body: kids.length
-          ? `TEST: guardian OK (dzieci=${kids.length})`
-          : `TEST: guardian NIE (dzieci=0)`,
-        userId: sender.id
-      });
-
       await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
       return true;;
     }
@@ -2037,16 +2029,8 @@ app.post('/webhook', async (req, res) => {
                 
                 if (choice === 'absence') {
                   const kids = await getUserChildren(client, sender.id);
-
-                    await sendText({
-                    to: m.from,
-                    body: kids.length
-                      ? `TEST: guardian OK (dzieci=${kids.length})`
-                      : `TEST: guardian NIE (dzieci=0)`,
-                    userId: sender.id
-                });
-                await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
-                localHandled = true;
+                  await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
+                  localHandled = true;
 
                 } else if (choice === 'makeup') {
                   await sendMakeupMenu({ client, to: m.from, userId: sender.id });
