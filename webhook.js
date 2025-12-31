@@ -230,6 +230,21 @@ async function resolveSenderType(client, wa) {
   return { type: 'none' };
 }
 
+async function getUserChildren(client, guardianUserId) {
+  const { rows } = await client.query(
+    `
+    SELECT u.id, u.first_name, u.last_name, u.is_active
+    FROM public.user_guardians g
+    JOIN public.users u ON u.id = g.child_user_id
+    WHERE g.guardian_user_id = $1
+      AND u.is_active = true
+    ORDER BY u.first_name, u.last_name
+    `,
+    [guardianUserId]
+  );
+  return rows;
+}
+
 async function sendInstructorMenu({ to, instructorId }) {
   const toNorm = normalizeTo(to);
 
@@ -1339,6 +1354,16 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     const id = m.interactive.list_reply?.id || '';
 
     if (id === 'menu_absence') {
+      const kids = await getUserChildren(client, sender.id);
+
+      await sendText({
+        to: m.from,
+        body: kids.length
+          ? `TEST: guardian OK (dzieci=${kids.length})`
+          : `TEST: guardian NIE (dzieci=0)`,
+        userId: sender.id
+      });
+
       await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
       return true;
     }
@@ -1873,11 +1898,22 @@ app.post('/webhook', async (req, res) => {
                 const choice = parseMainMenuChoice(m.text.body);
                 
                 if (choice === 'absence') {
-                  await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
-                  localHandled = true;
+                  const kids = await getUserChildren(client, sender.id);
+
+                    await sendText({
+                    to: m.from,
+                    body: kids.length
+                      ? `TEST: guardian OK (dzieci=${kids.length})`
+                      : `TEST: guardian NIE (dzieci=0)`,
+                    userId: sender.id
+                });
+                await sendUpcomingClassesMenu({ client, to: m.from, userId: sender.id });
+                localHandled = true;
+
                 } else if (choice === 'makeup') {
                   await sendMakeupMenu({ client, to: m.from, userId: sender.id });
                   localHandled = true;
+                  
                 } else if (choice === 'credits') {
                   await sendCreditsInfoAndFollowup({
                     client,
