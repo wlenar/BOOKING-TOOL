@@ -216,7 +216,10 @@ async function resolveSenderType(client, wa) {
       LIMIT 1`,
     [waPlus, waBare]
   );
-  if (u.rowCount > 0) return { type: 'user', ...u.rows[0] };
+  if (u.rowCount > 0) {
+    const row = u.rows[0];
+    return { type: 'user', ...row, id: Number(row.id) };
+  }
 
   const i = await client.query(
       `SELECT id, first_name AS name, is_active AS active
@@ -225,7 +228,11 @@ async function resolveSenderType(client, wa) {
       LIMIT 1`,
     [waPlus, waBare]
   );
-  if (i.rowCount > 0) return { type: 'instructor', ...i.rows[0] };
+
+  if (i.rowCount > 0) {
+    const row = i.rows[0];
+    return { type: 'instructor', ...row, id: Number(row.id) };
+  }
 
   return { type: 'none' };
 }
