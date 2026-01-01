@@ -1259,6 +1259,15 @@ async function handleAbsenceInteractive({ client, m, sender }) {
 
     if (!actingUserId || !classTemplateId) return false;
 
+    console.log('[DBG][ABSENCE]', {
+      from: m.from,
+      senderId: sender.id,
+      listId: m.interactive?.list_reply?.id,
+      actingUserId,
+      ymd,
+      classTemplateId
+    });
+
     // jeśli rodzic działa na dziecku -> walidacja relacji
     if (actingUserId !== sender.id) {
       const { rowCount } = await client.query(
@@ -1533,6 +1542,15 @@ async function handleMakeupInteractive({ client, m, sender }) {
     });
     return true;
   }
+
+  console.log('[DBG][MAKEUP]', {
+    from: m.from,
+    senderId: sender.id,
+    listId: m.interactive?.list_reply?.id,
+    actingUserId,
+    sessionYmd,
+    classTemplateId
+  });
 
   // jeśli rodzic działa na dziecku -> walidacja relacji
   if (actingUserId !== sender.id) {
