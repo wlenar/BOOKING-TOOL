@@ -2678,7 +2678,7 @@ async function sendInstructorClassesForDay({ client, to, instructorId, dayOffset
     const timeFrom = r.start_time.toString().slice(0,5);
     const timeTo = r.end_time.toString().slice(0,5);
     const absentNote = Number(r.absent_count) > 0 ? `, nieob.: ${r.absent_count}` : '';
-    const holidayNote = Number(r.present_count) === 0 ? ' — 🏦 święto' : '';
+    const holidayNote = Number(r.present_count) === 0 ? ' — święto' : '';
     return `• ${timeFrom}-${timeTo} ${r.group_name} (${r.present_count}/${r.max_capacity}${absentNote}, wolne: ${r.open_slots})${holidayNote}`;
   });
 
