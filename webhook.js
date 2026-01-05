@@ -2621,6 +2621,16 @@ async function sendInstructorClassesForDay({ client, to, instructorId, dayOffset
       FROM public.enrollments e
       GROUP BY e.class_template_id
     ),
+    abs AS (
+      SELECT
+        a.class_template_id,
+        a.session_date,
+        COUNT(*) AS absent_count
+      FROM public.absences a
+      JOIN target_day td
+        ON td.d = a.session_date
+      GROUP BY a.class_template_id, a.session_date
+    ),
     os_open AS (
       SELECT
         s.class_template_id,
@@ -2637,10 +2647,15 @@ async function sendInstructorClassesForDay({ client, to, instructorId, dayOffset
       b.group_name,
       b.max_capacity,
       COALESCE(e.enrolled_count, 0) AS enrolled_count,
+      COALESCE(a.absent_count, 0)   AS absent_count,
+      GREATEST(COALESCE(e.enrolled_count, 0) - COALESCE(a.absent_count, 0), 0) AS present_count,
       COALESCE(o.open_slots, 0)     AS open_slots
     FROM base b
     LEFT JOIN enr e
       ON e.class_template_id = b.class_template_id
+    LEFT JOIN abs a
+      ON a.class_template_id = b.class_template_id
+     AND a.session_date = b.session_date
     LEFT JOIN os_open o
       ON o.class_template_id = b.class_template_id
      AND o.session_date = b.session_date
@@ -2662,7 +2677,9 @@ async function sendInstructorClassesForDay({ client, to, instructorId, dayOffset
   const lines = rows.map(r => {
     const timeFrom = r.start_time.toString().slice(0,5);
     const timeTo = r.end_time.toString().slice(0,5);
-    return `• ${timeFrom}-${timeTo} ${r.group_name} (${r.enrolled_count}/${r.max_capacity}, wolne: ${r.open_slots})`;
+    const absentNote = Number(r.absent_count) > 0 ? `, nieob.: ${r.absent_count}` : '';
+    const holidayNote = Number(r.present_count) === 0 ? ' — 🏦 święto' : '';
+    return `• ${timeFrom}-${timeTo} ${r.group_name} (${r.present_count}/${r.max_capacity}${absentNote}, wolne: ${r.open_slots})${holidayNote}`;
   });
 
   await sendText({
