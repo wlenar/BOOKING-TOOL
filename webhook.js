@@ -2746,10 +2746,11 @@ async function sendInstructorMakeupsList({ client, to, instructorId }) {
   const { rows } = await client.query(
     `
     SELECT
-      session_date,
-      session_time,
+      to_char(session_date, 'DD Mon') AS session_date_label,
+      weekday_name_pl,
+      to_char(session_time, 'HH24:MI') AS session_time_label,
       group_name,
-      client_name
+     client_name
     FROM public.get_instructor_makeup_takers($1, 14)
     LIMIT 10
     `,
@@ -2761,10 +2762,9 @@ async function sendInstructorMakeupsList({ client, to, instructorId }) {
     return;
   }
 
-  const lines = rows.map(r => {
-    const t = String(r.session_time).slice(0, 5);
-    return `• ${r.session_date} ${t} — ${r.group_name} — ${r.client_name}`;
-  });
+  const lines = rows.map(r =>
+    `• ${r.session_date_label} ${r.weekday_name_pl} ${r.session_time_label} ${r.group_name} - ${r.client_name}`
+  );
 
   await sendText({
     to: toNorm,
