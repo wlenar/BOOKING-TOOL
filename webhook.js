@@ -308,7 +308,7 @@ async function sendInstructorMenu({ to, instructorId }) {
                 description: 'Frekwencja i odrabiania'
               },
               {
-                id: 'instructor_makeups_list',
+                id: 'instr_makeups_list',
                 title: '🔁 Odrabiania – lista',
                  description: 'Kto dopisał się na Twoje zajęcia'
               },
