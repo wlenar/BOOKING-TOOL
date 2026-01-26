@@ -308,6 +308,11 @@ async function sendInstructorMenu({ to, instructorId }) {
                 description: 'Frekwencja i odrabiania'
               },
               {
+                id: 'instructor_makeups_list',
+                title: '🔁 Odrabiania – lista',
+                 description: 'Kto dopisał się na Twoje zajęcia'
+              },
+              {
                 id: 'instr_end',
                 title: '🏁 Zakończ',
                 description: 'Zakończ rozmowę'
@@ -2735,6 +2740,38 @@ async function sendInstructorAbsences7d({ client, to, instructorId }) {
   });
 }
 
+async function sendInstructorMakeupsList({ client, to, instructorId }) {
+  const toNorm = normalizeTo(to);
+
+  const { rows } = await client.query(
+    `
+    SELECT
+      session_date,
+      session_time,
+      group_name,
+      client_name
+    FROM public.get_instructor_makeup_takers($1, 14)
+    LIMIT 10
+    `,
+    [instructorId]
+  );
+
+  if (!rows.length) {
+    await sendText({ to: toNorm, body: 'Brak zapisów na odrabiania w najbliższych 14 dniach.' });
+    return;
+  }
+
+  const lines = rows.map(r => {
+    const t = String(r.session_time).slice(0, 5);
+    return `• ${r.session_date} ${t} — ${r.group_name} — ${r.client_name}`;
+  });
+
+  await sendText({
+    to: toNorm,
+    body: '🔁 Odrabiania – lista (najbliższe):\n' + lines.join('\n')
+  });
+}
+
 async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
   const toNorm = normalizeTo(to);
 
@@ -3028,6 +3065,11 @@ async function handleInstructorInteractive({ client, m, sender }) {
 
     if (id === 'instr_absences_7d') {
       await sendInstructorAbsences7d({ client, to: m.from, instructorId: sender.id });
+      return true;
+    }
+
+    if (id === 'instr_makeups_list') {
+      await sendInstructorMakeupsList({ client, to: m.from, instructorId: sender.id });
       return true;
     }
 
