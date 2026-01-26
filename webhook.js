@@ -2747,10 +2747,18 @@ async function sendInstructorMakeupsList({ client, to, instructorId }) {
     `
     SELECT
       to_char(session_date, 'DD Mon') AS session_date_label,
-      weekday_name_pl,
+      CASE EXTRACT(ISODOW FROM session_date)::int
+        WHEN 1 THEN 'Pon'
+        WHEN 2 THEN 'Wt'
+        WHEN 3 THEN 'Śr'
+        WHEN 4 THEN 'Czw'
+        WHEN 5 THEN 'Pt'
+        WHEN 6 THEN 'Sob'
+        WHEN 7 THEN 'Nd'
+      END AS weekday_pl,
       to_char(session_time, 'HH24:MI') AS session_time_label,
       group_name,
-     client_name
+      client_name
     FROM public.get_instructor_makeup_takers($1, 14)
     LIMIT 10
     `,
@@ -2763,7 +2771,7 @@ async function sendInstructorMakeupsList({ client, to, instructorId }) {
   }
 
   const lines = rows.map(r =>
-    `• ${r.session_date_label} ${r.weekday_name_pl} ${r.session_time_label} ${r.group_name} - ${r.client_name}`
+  `• ${r.session_date_label} ${r.weekday_pl} ${r.session_time_label} ${r.group_name} - ${r.client_name}`
   );
 
   await sendText({
