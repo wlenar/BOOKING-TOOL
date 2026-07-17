@@ -141,6 +141,40 @@ function getSeasonEmoji() {
   return "🌟";
 }
 
+
+const REGULAR_SCHEDULE_PAUSE_START = '2026-08-01';
+const REGULAR_SCHEDULE_PAUSE_END = '2026-08-31';
+
+function dateYmdInTimeZone(date = new Date(), timeZone = 'Europe/Warsaw') {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, part.value])
+  );
+
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function isRegularSchedulePausedDate(ymd) {
+  const date = String(ymd || '').slice(0, 10);
+  return date >= REGULAR_SCHEDULE_PAUSE_START
+    && date <= REGULAR_SCHEDULE_PAUSE_END;
+}
+
+function isRegularSchedulePausedNow() {
+  return isRegularSchedulePausedDate(dateYmdInTimeZone());
+}
+
+const REGULAR_SCHEDULE_PAUSE_MESSAGE =
+  'W sierpniu regularne zajęcia są zawieszone. Zapraszamy do zapisów na Open Studio.';
+
 // =========================
 // DB HELPERS
 // =========================
@@ -1441,6 +1475,7 @@ async function getUpcomingUserClasses(client, userId) {
      AND bh.is_active = true
     WHERE EXTRACT(ISODOW FROM d) = ct.weekday_iso
       AND bh.holiday_date IS NULL        -- ⬅️ kluczowe: odfiltruj święta
+      AND d::date NOT BETWEEN DATE '2026-08-01' AND DATE '2026-08-31'
     ORDER BY session_date, ct.start_time, class_template_id;
   `;
   const res = await client.query(sql, [userId]);
@@ -1449,6 +1484,15 @@ async function getUpcomingUserClasses(client, userId) {
 
 async function sendUpcomingClassesMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
+
+  if (isRegularSchedulePausedNow()) {
+    return sendText({
+      to: toNorm,
+      body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+      userId
+    });
+  }
+
   const rows = await getUpcomingUserClasses(client, userId);
 
   if (!rows || rows.length === 0) {
@@ -1570,6 +1614,42 @@ async function sendMainMenu({ to, userId }) {
   }
 
   const emoji = getSeasonEmoji();
+  const regularSchedulePaused = isRegularSchedulePausedNow();
+
+  const menuRows = [
+    ...(!regularSchedulePaused ? [
+      {
+        id: 'menu_absence',
+        title: '📅 Zgłoś nieobecność',
+        description: 'Zwolnij miejsce na zajęcia'
+      },
+      {
+        id: 'menu_makeup',
+        title: '🎯 Odrób zajęcia',
+        description: 'Zarezerwuj wolny termin'
+      }
+    ] : []),
+    {
+      id: 'menu_credits',
+      title: '🔢 Moje nieobecności',
+      description: 'Sprawdź ile masz do odrobienia'
+    },
+    {
+      id: 'menu_open_studio',
+      title: '🌞 Open Studio',
+      description: 'Zapisz się na sierpniowe zajęcia'
+    },
+    {
+      id: 'menu_open_studio_bookings',
+      title: '🗓️ Moje zapisy',
+      description: 'Sprawdź lub anuluj Open Studio'
+    },
+    {
+      id: 'menu_end',
+      title: '🏁 Zakończ rozmowę',
+      description: 'Zamknij czat bez zmian'
+    }
+  ];
 
   const payload = {
     messaging_product: 'whatsapp',
@@ -1585,38 +1665,7 @@ async function sendMainMenu({ to, userId }) {
         sections: [
           {
             title: 'Dostępne opcje',
-            rows: [
-              {
-                id: 'menu_absence',
-                title: '📅 Zgłoś nieobecność',
-                description: 'Zwolnij miejsce na zajęcia'
-              },
-              {
-                id: 'menu_makeup',
-                title: '🎯 Odrób zajęcia',
-                description: 'Zarezerwuj wolny termin'
-              },
-              {
-                id: 'menu_credits',
-                title: '🔢 Moje nieobecności',
-                description: 'Sprawdź ile masz do odrobienia'
-              },
-              {
-                id: 'menu_open_studio',
-                title: '🌞 Open Studio',
-                description: 'Zapisz się na sierpniowe zajęcia'
-              },
-              {
-                id: 'menu_open_studio_bookings',
-                title: '🗓️ Moje zapisy',
-                description: 'Sprawdź lub anuluj Open Studio'
-              },
-              {
-                id: 'menu_end',
-                title: '🏁 Zakończ rozmowę',
-                description: 'Zamknij czat bez zmian'
-              }
-            ]
+            rows: menuRows
           }
         ]
       }
@@ -1625,8 +1674,7 @@ async function sendMainMenu({ to, userId }) {
 
   const res = await postWA({ phoneId: WA_PHONE_ID, payload });
 
-  const bodyLog =
-    'MENU_GLOWNE: [Zgłoś nieobecność] [Odrób zajęcia] [Moje nieobecności] [Open Studio] [Moje zapisy Open Studio] [Zakończ rozmowę]';
+  const bodyLog = 'MENU_GLOWNE: ' + menuRows.map((row) => `[${row.title}]`).join(' ');
 
   if (res.ok) {
     const waMessageId = res.data?.messages?.[0]?.id || null;
@@ -1697,8 +1745,8 @@ async function sendCreditsInfoAndFollowup({ client, to, userId }) {
   // jeśli brak WA config – kończymy na samym tekście
   if (!WA_TOKEN || !WA_PHONE_ID) return;
 
-  // brak kredytów → przyciski "Menu główne / Zakończ rozmowę"
-  if (total <= 0) {
+  // brak kredytów lub przerwa w regularnym grafiku → bez wejścia do odrabiania
+  if (total <= 0 || isRegularSchedulePausedNow()) {
     const payload = {
       messaging_product: 'whatsapp',
       to: toNorm,
@@ -1832,6 +1880,14 @@ async function sendAbsenceMoreQuestion({ to, userId }) {
 async function sendWhoAbsenceMenu({ client, to, guardianUserId }) {
   const toNorm = normalizeTo(to);
 
+  if (isRegularSchedulePausedNow()) {
+    return sendText({
+      to: toNorm,
+      body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+      userId: guardianUserId
+    });
+  }
+
   const children = await getUserChildren(client, guardianUserId);
 
   // brak dzieci -> stare zachowanie
@@ -1904,6 +1960,14 @@ async function sendWhoAbsenceMenu({ client, to, guardianUserId }) {
 
 async function sendGuardianWhoMenu({ client, to, guardianUserId, context }) {
   const toNorm = normalizeTo(to);
+
+  if (context === 'makeup' && isRegularSchedulePausedNow()) {
+    return sendText({
+      to: toNorm,
+      body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+      userId: guardianUserId
+    });
+  }
 
   // jeśli kiedyś zechcesz ujednolicić absences też tym wrapperem:
   if (context === 'absence') {
@@ -1979,6 +2043,14 @@ async function sendGuardianWhoMenu({ client, to, guardianUserId, context }) {
 
 async function sendMakeupMenu({ client, to, userId }) {
   const toNorm = normalizeTo(to);
+
+  if (isRegularSchedulePausedNow()) {
+    return sendText({
+      to: toNorm,
+      userId,
+      body: REGULAR_SCHEDULE_PAUSE_MESSAGE
+    });
+  }
 
   const userRes = await client.query(
     `
@@ -2067,7 +2139,9 @@ async function sendMakeupMenu({ client, to, userId }) {
   const { rows } = await client.query(
     `
     SELECT *
-    FROM public.get_available_makeup_slots($1, $2)
+    FROM public.get_available_makeup_slots($1, $2) AS available_slot
+    WHERE available_slot.session_date_ymd::date
+          NOT BETWEEN DATE '2026-08-01' AND DATE '2026-08-31'
     LIMIT 10
     `,
     [userId, 14]
@@ -2159,6 +2233,11 @@ async function sendMakeupMenu({ client, to, userId }) {
 }
 
 async function runWeeklySlotsJob() {
+  if (isRegularSchedulePausedNow()) {
+    console.log('[CRON] job_weekly_slots skipped (regular schedule paused in August 2026)');
+    return;
+  }
+
   const client = await pool.connect();
   try {
     console.log('[CRON] job_weekly_slots start');
@@ -2172,6 +2251,11 @@ async function runWeeklySlotsJob() {
 }
 
 async function runWeeklySlotsBroadcast() {
+  if (isRegularSchedulePausedNow()) {
+    console.log('[CRON] weekly_slots_broadcast skipped (regular schedule paused in August 2026)');
+    return;
+  }
+
   if (!WA_TOKEN || !WA_PHONE_ID) {
     console.log('[CRON] weekly_slots_broadcast skipped (missing WA config)');
     return;
@@ -2215,7 +2299,9 @@ async function runWeeklySlotsBroadcast() {
       const { rows: slots } = await client.query(
         `
         SELECT *
-        FROM public.get_available_makeup_slots($1, $2)
+        FROM public.get_available_makeup_slots($1, $2) AS available_slot
+        WHERE available_slot.session_date_ymd::date
+              NOT BETWEEN DATE '2026-08-01' AND DATE '2026-08-31'
         LIMIT 10
         `,
         [u.user_id, 7]     // broadcast: 7 dni do przodu
@@ -2441,6 +2527,15 @@ async function handleAbsenceInteractive({ client, m, sender }) {
       return true;
     }
 
+    if (result.reason === 'regular_schedule_paused') {
+      await sendText({
+        to: m.from,
+        body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+        userId: sender.id
+      });
+      return true;
+    }
+
     if (result.reason === 'past_date') {
       await sendText({
         to: m.from,
@@ -2634,6 +2729,15 @@ async function handleMakeupInteractive({ client, m, sender }) {
     return true;
   }
 
+  if (isRegularSchedulePausedDate(sessionYmd)) {
+    await sendText({
+      to: m.from,
+      userId: sender.id,
+      body: REGULAR_SCHEDULE_PAUSE_MESSAGE
+    });
+    return true;
+  }
+
   console.log('[DBG][MAKEUP]', {
     from: m.from,
     senderId: sender.id,
@@ -2811,13 +2915,29 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     const id = m.interactive.list_reply?.id || '';
 
     if (id === 'menu_absence') {
-      const kids = await getUserChildren(client, sender.id);
+      if (isRegularSchedulePausedNow()) {
+        await sendText({
+          to: m.from,
+          body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+          userId: sender.id
+        });
+        return true;
+      }
 
       await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
-      return true;;
+      return true;
     }
 
     if (id === 'menu_makeup') {
+      if (isRegularSchedulePausedNow()) {
+        await sendText({
+          to: m.from,
+          body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+          userId: sender.id
+        });
+        return true;
+      }
+
       const children = await getUserChildren(client, sender.id);
 
       if (children.length > 0) {
@@ -2877,6 +2997,15 @@ async function handleMainMenuInteractive({ client, m, sender }) {
     const replyId = m.interactive.button_reply?.id || '';
 
     if (replyId === 'credits_makeup') {
+      if (isRegularSchedulePausedNow()) {
+        await sendText({
+          to: m.from,
+          body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+          userId: sender.id
+        });
+        return true;
+      }
+
       const children = await getUserChildren(client, sender.id);
 
       if (children.length > 0) {
@@ -2970,6 +3099,10 @@ function parseMainMenuChoice(text) {
 // Główna operacja: zgłoszenie nieobecności + slot + kredyt
 // =========================
 async function processAbsence(client, userId, ymd, classTemplateIdHint = null) {
+  if (isRegularSchedulePausedDate(ymd)) {
+    return { ok: false, reason: 'regular_schedule_paused' };
+  }
+
   try {
     await client.query('BEGIN');
 
@@ -3414,11 +3547,27 @@ app.post('/webhook', async (req, res) => {
                 const choice = parseMainMenuChoice(m.text.body);
                 
                 if (choice === 'absence') {
-                  await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
+                  if (isRegularSchedulePausedNow()) {
+                    await sendText({
+                      to: m.from,
+                      body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+                      userId: sender.id
+                    });
+                  } else {
+                    await sendWhoAbsenceMenu({ client, to: m.from, guardianUserId: sender.id });
+                  }
                   localHandled = true;
 
                 } else if (choice === 'makeup') {
-                  const children = await getUserChildren(client, sender.id);
+                  if (isRegularSchedulePausedNow()) {
+                    await sendText({
+                      to: m.from,
+                      body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+                      userId: sender.id
+                    });
+                    localHandled = true;
+                  } else {
+                    const children = await getUserChildren(client, sender.id);
 
                   if (children.length > 0) {
                     await sendGuardianWhoMenu({
@@ -3430,8 +3579,9 @@ app.post('/webhook', async (req, res) => {
                   } else {
                     await sendMakeupMenu({ client, to: m.from, userId: sender.id });
                   }
-                localHandled = true;
-                  
+                    localHandled = true;
+                  }
+
                 } else if (choice === 'credits') {
                   await sendCreditsInfoAndFollowup({
                     client,
@@ -3461,6 +3611,13 @@ app.post('/webhook', async (req, res) => {
                           userId: sender.id
                         });
                         await sendAbsenceMoreQuestion({ to: m.from, userId: sender.id });
+                        localHandled = true;
+                      } else if (result.reason === 'regular_schedule_paused') {
+                        await sendText({
+                          to: m.from,
+                          body: REGULAR_SCHEDULE_PAUSE_MESSAGE,
+                          userId: sender.id
+                        });
                         localHandled = true;
                       } else if (result.reason === 'past_date') {
                         await sendText({
@@ -3525,6 +3682,11 @@ app.post('/webhook', async (req, res) => {
 });
 
 async function sendAbsenceReminderTemplate() {
+  if (isRegularSchedulePausedNow()) {
+    console.log('[CRON] absence_reminder skipped (regular schedule paused in August 2026)');
+    return;
+  }
+
   if (!WA_TOKEN || !WA_PHONE_ID) {
     console.log('[CRON] absence_reminder skipped (missing WA config)');
     return;
@@ -3711,6 +3873,20 @@ async function sendPaymentReminderTemplate() {
 async function sendInstructorClassesForDay({ client, to, instructorId, dayOffset }) {
   const toNorm = normalizeTo(to);
 
+  const { rows: targetDateRows } = await client.query(
+    `SELECT to_char(current_date + $1::int, 'YYYY-MM-DD') AS target_ymd`,
+    [dayOffset]
+  );
+  const targetYmd = targetDateRows[0]?.target_ymd;
+
+  if (isRegularSchedulePausedDate(targetYmd)) {
+    await sendText({
+      to: toNorm,
+      body: REGULAR_SCHEDULE_PAUSE_MESSAGE
+    });
+    return;
+  }
+
   const { rows } = await client.query(
     `
     WITH target_day AS (
@@ -3874,6 +4050,7 @@ async function sendInstructorMakeupsList({ client, to, instructorId }) {
       group_name,
       client_name
     FROM public.get_instructor_makeup_takers($1, 14)
+    WHERE session_date NOT BETWEEN DATE '2026-08-01' AND DATE '2026-08-31'
     LIMIT 10
     `,
     [instructorId]
@@ -3896,6 +4073,14 @@ async function sendInstructorMakeupsList({ client, to, instructorId }) {
 
 async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
   const toNorm = normalizeTo(to);
+
+  if (isRegularSchedulePausedNow()) {
+    await sendText({
+      to: toNorm,
+      body: REGULAR_SCHEDULE_PAUSE_MESSAGE
+    });
+    return;
+  }
 
   if (!WA_TOKEN || !WA_PHONE_ID) {
     await auditOutbound({
@@ -3928,9 +4113,11 @@ async function sendInstructorAddSlotMenu({ client, to, instructorId }) {
      AND g.is_active = true
      AND g.instructor_id = $1
     WHERE
-      -- tylko przyszłość:
-      d.d > current_date
-      OR (d.d = current_date AND ct.start_time > now()::time)
+      (
+        d.d > current_date
+        OR (d.d = current_date AND ct.start_time > now()::time)
+      )
+      AND d.d NOT BETWEEN DATE '2026-08-01' AND DATE '2026-08-31'
     ORDER BY d.d, ct.start_time, g.name
     LIMIT 10
     `,
@@ -4024,6 +4211,14 @@ async function handleInstructorAddSlotSelection({ client, m, sender }) {
     return true;
   }
 
+  if (isRegularSchedulePausedDate(ymd)) {
+    await sendText({
+      to: toNorm,
+      body: REGULAR_SCHEDULE_PAUSE_MESSAGE
+    });
+    return true;
+  }
+
   // blokada dat wstecz
   const { rows: pastRows } = await client.query(
     'SELECT $1::date < current_date AS is_past',
@@ -4111,6 +4306,7 @@ async function sendInstructorStats7d({ client, to, instructorId }) {
         ON g.id = ct.group_id
        AND g.is_active = true
        AND g.instructor_id = $1
+      WHERE d.d NOT BETWEEN DATE '2026-08-01' AND DATE '2026-08-31'
     ),
     abs AS (
       SELECT COUNT(*) AS total_absences
