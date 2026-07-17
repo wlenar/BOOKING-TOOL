@@ -453,8 +453,8 @@ async function sendOpenStudioMenu({ client, to, userId, offset = 0 }) {
     if (title.length > 24) title = title.slice(0, 24);
 
     const placeLabel = places === 1 ? '1 wolne miejsce' : `${places} wolnych miejsc`;
-    const description = `${placeLabel} • ${session.location_name} • ${session.instructor_name}`;
-
+    const description = `${placeLabel} • ${session.instructor_name}`;
+    
     return {
       id: `os_book_${userId}_${session.session_id}`,
       title,
