@@ -722,6 +722,605 @@ async function handleOpenStudioInteractive({ client, m, sender }) {
   }
 }
 
+
+async function sendWhoOpenStudioBookingsMenu({ client, to, guardianUserId }) {
+  const toNorm = normalizeTo(to);
+  const children = await getUserChildren(client, guardianUserId);
+
+  if (!children || children.length === 0) {
+    return sendOpenStudioBookingsMenu({
+      client,
+      to: toNorm,
+      userId: guardianUserId,
+      offset: 0
+    });
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: guardianUserId,
+      to: toNorm,
+      body: 'WHO_OPEN_STUDIO_BOOKINGS (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_buttons',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const buttons = [
+    {
+      type: 'reply',
+      reply: { id: 'who_osb_self', title: 'Moje' }
+    },
+    ...children.slice(0, 2).map((child) => ({
+      type: 'reply',
+      reply: {
+        id: `who_osb_child_${child.id}`,
+        title: String(child.first_name || 'Dziecko').trim().slice(0, 20)
+      }
+    }))
+  ];
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: 'Czyje zapisy Open Studio chcesz sprawdzić?' },
+      action: { buttons }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+  const bodyLog = 'WHO_OPEN_STUDIO_BOOKINGS: ' + buttons.map((b) => `[${b.reply.title}]`).join(' ');
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+
+  await auditOutbound({
+    userId: guardianUserId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_buttons',
+    status: res.ok ? 'sent' : 'error',
+    reason: res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed'),
+    waMessageId
+  });
+
+  return res;
+}
+
+async function sendOpenStudioBookingsMenu({ client, to, userId, offset = 0 }) {
+  const toNorm = normalizeTo(to);
+  const pageSize = 8;
+  const safeOffset = Math.max(0, Number(offset) || 0);
+
+  const userRes = await client.query(
+    `
+    SELECT id, is_active
+    FROM public.users
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [userId]
+  );
+
+  if (!userRes.rows[0]?.is_active) {
+    await sendText({
+      to: toNorm,
+      userId,
+      body: 'To konto nie jest aktywne. Skontaktuj się proszę ze studiem.'
+    });
+    return;
+  }
+
+  const { rows } = await client.query(
+    `
+    SELECT
+      b.id AS booking_id,
+      b.user_id,
+      s.session_date,
+      s.start_time,
+      s.end_time,
+      i.first_name AS instructor_name,
+      u.first_name AS participant_name
+    FROM public.open_studio_bookings b
+    JOIN public.open_studio_sessions s
+      ON s.id = b.session_id
+    JOIN public.instructors i
+      ON i.id = s.instructor_id
+    JOIN public.users u
+      ON u.id = b.user_id
+    WHERE b.user_id = $1
+      AND b.status = 'booked'
+      AND (s.session_date + s.start_time)
+          > (now() AT TIME ZONE 'Europe/Warsaw')
+    ORDER BY s.session_date, s.start_time, b.id
+    LIMIT $2
+    OFFSET $3
+    `,
+    [userId, pageSize + 1, safeOffset]
+  );
+
+  const hasNextPage = rows.length > pageSize;
+  const bookings = rows.slice(0, pageSize);
+
+  if (!bookings.length) {
+    if (safeOffset > 0) {
+      return sendOpenStudioBookingsMenu({
+        client,
+        to: toNorm,
+        userId,
+        offset: Math.max(0, safeOffset - pageSize)
+      });
+    }
+
+    await sendText({
+      to: toNorm,
+      userId,
+      body: 'Nie masz obecnie żadnych przyszłych rezerwacji Open Studio.'
+    });
+    await sendMainMenu({ to: toNorm, userId });
+    return;
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId,
+      to: toNorm,
+      body: 'OPEN_STUDIO_BOOKINGS_MENU (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_list',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const listRows = bookings.map((booking) => {
+    const { iso, month, day } = openStudioDateParts(booking.session_date);
+    const weekday = openStudioWeekdayPl(iso);
+    const time = String(booking.start_time || '').slice(0, 5);
+
+    let title = `${weekday} ${day}/${month} ${time}`;
+    if (title.length > 24) title = title.slice(0, 24);
+
+    const instructor = String(booking.instructor_name || '').trim();
+    const description = instructor
+      ? `Prowadząca: ${instructor}`
+      : 'Wybierz, aby anulować zapis';
+
+    return {
+      id: `osb_cancel_${userId}_${booking.booking_id}`,
+      title,
+      description: description.slice(0, 72)
+    };
+  });
+
+  if (safeOffset > 0) {
+    listRows.push({
+      id: `osb_page_${userId}_${Math.max(0, safeOffset - pageSize)}`,
+      title: '⬅️ Poprzednie zapisy',
+      description: 'Wróć do wcześniejszych terminów'
+    });
+  }
+
+  if (hasNextPage) {
+    listRows.push({
+      id: `osb_page_${userId}_${safeOffset + pageSize}`,
+      title: '➡️ Kolejne zapisy',
+      description: 'Pokaż dalsze rezerwacje'
+    });
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: {
+        text: '🗓️ Twoje zapisy Open Studio\nWybierz rezerwację, którą chcesz anulować.'
+      },
+      action: {
+        button: 'Wybierz zapis',
+        sections: [
+          {
+            title: 'Przyszłe rezerwacje',
+            rows: listRows
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+  const bodyLog = 'OPEN_STUDIO_BOOKINGS_MENU: ' + listRows.map((row) => row.title).join(' | ');
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+
+  await auditOutbound({
+    userId,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_list',
+    status: res.ok ? 'sent' : 'error',
+    reason: res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed'),
+    waMessageId
+  });
+
+  return res;
+}
+
+async function sendOpenStudioCancelConfirmation({ client, to, actorUserId, actingUserId, bookingId }) {
+  const toNorm = normalizeTo(to);
+  const authorized = await canManageUser(client, actorUserId, actingUserId);
+
+  if (!authorized) {
+    await sendText({
+      to: toNorm,
+      userId: actorUserId,
+      body: 'Brak uprawnień do zarządzania tym kontem.'
+    });
+    return;
+  }
+
+  const { rows } = await client.query(
+    `
+    SELECT
+      b.id AS booking_id,
+      to_char(s.session_date, 'DD/MM/YYYY') AS session_date_label,
+      to_char(s.start_time, 'HH24:MI') AS start_time_label,
+      to_char(s.end_time, 'HH24:MI') AS end_time_label,
+      i.first_name AS instructor_name,
+      u.first_name AS participant_name
+    FROM public.open_studio_bookings b
+    JOIN public.open_studio_sessions s
+      ON s.id = b.session_id
+    JOIN public.instructors i
+      ON i.id = s.instructor_id
+    JOIN public.users u
+      ON u.id = b.user_id
+    WHERE b.id = $1
+      AND b.user_id = $2
+      AND b.status = 'booked'
+      AND (s.session_date + s.start_time)
+          > (now() AT TIME ZONE 'Europe/Warsaw')
+    LIMIT 1
+    `,
+    [bookingId, actingUserId]
+  );
+
+  const booking = rows[0];
+  if (!booking) {
+    await sendText({
+      to: toNorm,
+      userId: actorUserId,
+      body: 'Ta rezerwacja nie jest już aktywna.'
+    });
+    await sendOpenStudioBookingsMenu({ client, to: toNorm, userId: actingUserId, offset: 0 });
+    return;
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: actorUserId,
+      to: toNorm,
+      body: 'OPEN_STUDIO_CANCEL_CONFIRMATION (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_buttons',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const participant = String(booking.participant_name || 'Uczestnik').trim();
+  const instructor = String(booking.instructor_name || '').trim();
+  const bodyText =
+    `Czy na pewno chcesz anulować ten zapis?\n\n` +
+    `Uczestnik: ${participant}\n` +
+    `Termin: ${booking.session_date_label} ${booking.start_time_label}-${booking.end_time_label}` +
+    (instructor ? `\nProwadząca: ${instructor}` : '');
+
+  const buttons = [
+    {
+      type: 'reply',
+      reply: {
+        id: `osb_confirm_${actingUserId}_${bookingId}`,
+        title: '✅ Tak, anuluj'
+      }
+    },
+    {
+      type: 'reply',
+      reply: {
+        id: `osb_back_${actingUserId}`,
+        title: '↩️ Nie, wróć'
+      }
+    }
+  ];
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: bodyText },
+      action: { buttons }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+
+  await auditOutbound({
+    userId: actorUserId,
+    to: toNorm,
+    body: `OPEN_STUDIO_CANCEL_CONFIRMATION: booking_id=${bookingId}`,
+    messageType: 'interactive_buttons',
+    status: res.ok ? 'sent' : 'error',
+    reason: res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed'),
+    waMessageId
+  });
+
+  return res;
+}
+
+async function handleWhoOpenStudioBookingsInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'user' || !sender.active) return false;
+  if (m.type !== 'interactive' || m.interactive?.type !== 'button_reply') return false;
+
+  const id = m.interactive.button_reply?.id || '';
+  if (!id.startsWith('who_osb_')) return false;
+
+  if (id === 'who_osb_self') {
+    await sendOpenStudioBookingsMenu({
+      client,
+      to: m.from,
+      userId: sender.id,
+      offset: 0
+    });
+    return true;
+  }
+
+  if (id.startsWith('who_osb_child_')) {
+    const childId = Number(id.split('_')[3]) || 0;
+    const authorized = childId
+      ? await canManageUser(client, sender.id, childId)
+      : false;
+
+    if (!authorized) {
+      await sendText({
+        to: m.from,
+        userId: sender.id,
+        body: 'Brak uprawnień do zarządzania tym kontem.'
+      });
+      return true;
+    }
+
+    await sendOpenStudioBookingsMenu({
+      client,
+      to: m.from,
+      userId: childId,
+      offset: 0
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function handleOpenStudioBookingsInteractive({ client, m, sender }) {
+  if (!sender || sender.type !== 'user' || !sender.active) return false;
+  if (m.type !== 'interactive') return false;
+
+  const interactiveType = m.interactive?.type || '';
+
+  if (interactiveType === 'list_reply') {
+    const id = m.interactive.list_reply?.id || '';
+
+    if (id.startsWith('osb_page_')) {
+      const parts = id.split('_');
+      const actingUserId = Number(parts[2]) || 0;
+      const offset = Number(parts[3]) || 0;
+      const authorized = actingUserId
+        ? await canManageUser(client, sender.id, actingUserId)
+        : false;
+
+      if (!authorized) {
+        await sendText({
+          to: m.from,
+          userId: sender.id,
+          body: 'Brak uprawnień do zarządzania tym kontem.'
+        });
+        return true;
+      }
+
+      await sendOpenStudioBookingsMenu({
+        client,
+        to: m.from,
+        userId: actingUserId,
+        offset
+      });
+      return true;
+    }
+
+    if (!id.startsWith('osb_cancel_')) return false;
+
+    const parts = id.split('_');
+    const actingUserId = Number(parts[2]) || 0;
+    const bookingId = Number(parts[3]) || 0;
+
+    if (!actingUserId || !bookingId) {
+      await sendText({
+        to: m.from,
+        userId: sender.id,
+        body: 'Nie udało się rozpoznać rezerwacji. Spróbuj ponownie.'
+      });
+      return true;
+    }
+
+    await sendOpenStudioCancelConfirmation({
+      client,
+      to: m.from,
+      actorUserId: sender.id,
+      actingUserId,
+      bookingId
+    });
+    return true;
+  }
+
+  if (interactiveType === 'button_reply') {
+    const id = m.interactive.button_reply?.id || '';
+
+    if (id.startsWith('osb_back_')) {
+      const actingUserId = Number(id.split('_')[2]) || 0;
+      const authorized = actingUserId
+        ? await canManageUser(client, sender.id, actingUserId)
+        : false;
+
+      if (!authorized) {
+        await sendText({
+          to: m.from,
+          userId: sender.id,
+          body: 'Brak uprawnień do zarządzania tym kontem.'
+        });
+        return true;
+      }
+
+      await sendOpenStudioBookingsMenu({
+        client,
+        to: m.from,
+        userId: actingUserId,
+        offset: 0
+      });
+      return true;
+    }
+
+    if (!id.startsWith('osb_confirm_')) return false;
+
+    const parts = id.split('_');
+    const actingUserId = Number(parts[2]) || 0;
+    const bookingId = Number(parts[3]) || 0;
+
+    if (!actingUserId || !bookingId) {
+      await sendText({
+        to: m.from,
+        userId: sender.id,
+        body: 'Nie udało się rozpoznać rezerwacji. Spróbuj ponownie.'
+      });
+      return true;
+    }
+
+    const authorized = await canManageUser(client, sender.id, actingUserId);
+    if (!authorized) {
+      await sendText({
+        to: m.from,
+        userId: sender.id,
+        body: 'Brak uprawnień do zarządzania tym kontem.'
+      });
+      return true;
+    }
+
+    try {
+      const { rows: infoRows } = await client.query(
+        `
+        SELECT
+          b.user_id,
+          to_char(s.session_date, 'DD/MM/YYYY') AS session_date_label,
+          to_char(s.start_time, 'HH24:MI') AS start_time_label,
+          to_char(s.end_time, 'HH24:MI') AS end_time_label,
+          i.first_name AS instructor_name,
+          u.first_name AS participant_name
+        FROM public.open_studio_bookings b
+        JOIN public.open_studio_sessions s
+          ON s.id = b.session_id
+        JOIN public.instructors i
+          ON i.id = s.instructor_id
+        JOIN public.users u
+          ON u.id = b.user_id
+        WHERE b.id = $1
+          AND b.user_id = $2
+        LIMIT 1
+        `,
+        [bookingId, actingUserId]
+      );
+
+      const cancelRes = await client.query(
+        `
+        SELECT *
+        FROM public.cancel_open_studio_booking($1, $2)
+        `,
+        [bookingId, sender.id]
+      );
+
+      const result = cancelRes.rows[0];
+
+      if (result?.ok) {
+        const info = infoRows[0] || {};
+        const participant = String(info.participant_name || 'Uczestnik').trim();
+        const instructor = String(info.instructor_name || '').trim();
+
+        await sendText({
+          to: m.from,
+          userId: sender.id,
+          body:
+            `✅ Rezerwacja Open Studio została anulowana.\n` +
+            `Uczestnik: ${participant}\n` +
+            `Termin: ${info.session_date_label} ${info.start_time_label}-${info.end_time_label}` +
+            (instructor ? `\nProwadząca: ${instructor}` : '') +
+            `\nWolnych miejsc: ${result.available_places}`
+        });
+        await sendMainMenu({ to: m.from, userId: sender.id });
+        return true;
+      }
+
+      if (result?.reason === 'booking_not_active') {
+        await sendText({
+          to: m.from,
+          userId: sender.id,
+          body: 'Ta rezerwacja została już wcześniej anulowana.'
+        });
+      } else if (result?.reason === 'session_started') {
+        await sendText({
+          to: m.from,
+          userId: sender.id,
+          body: 'Nie można anulować zajęć, które już się rozpoczęły.'
+        });
+      } else if (result?.reason === 'not_authorized') {
+        await sendText({
+          to: m.from,
+          userId: sender.id,
+          body: 'Brak uprawnień do anulowania tej rezerwacji.'
+        });
+      } else if (result?.reason === 'user_not_active') {
+        await sendText({
+          to: m.from,
+          userId: sender.id,
+          body: 'Twoje konto nie jest aktywne.'
+        });
+      } else {
+        await sendText({
+          to: m.from,
+          userId: sender.id,
+          body: 'Nie znaleziono aktywnej rezerwacji do anulowania.'
+        });
+      }
+
+      await sendMainMenu({ to: m.from, userId: sender.id });
+      return true;
+    } catch (err) {
+      console.error('[handleOpenStudioBookingsInteractive] error', err);
+      await sendText({
+        to: m.from,
+        userId: sender.id,
+        body: 'Coś poszło nie tak przy anulowaniu rezerwacji Open Studio. Spróbuj ponownie lub skontaktuj się ze studiem.'
+      });
+      return true;
+    }
+  }
+
+  return false;
+}
+
 async function sendInstructorMenu({ to, instructorId }) {
   const toNorm = normalizeTo(to);
 
@@ -1008,6 +1607,11 @@ async function sendMainMenu({ to, userId }) {
                 description: 'Zapisz się na sierpniowe zajęcia'
               },
               {
+                id: 'menu_open_studio_bookings',
+                title: '🗓️ Moje zapisy',
+                description: 'Sprawdź lub anuluj Open Studio'
+              },
+              {
                 id: 'menu_end',
                 title: '🏁 Zakończ rozmowę',
                 description: 'Zamknij czat bez zmian'
@@ -1022,7 +1626,7 @@ async function sendMainMenu({ to, userId }) {
   const res = await postWA({ phoneId: WA_PHONE_ID, payload });
 
   const bodyLog =
-    'MENU_GLOWNE: [Zgłoś nieobecność] [Odrób zajęcia] [Moje nieobecności] [Open Studio] [Zakończ rozmowę]';
+    'MENU_GLOWNE: [Zgłoś nieobecność] [Odrób zajęcia] [Moje nieobecności] [Open Studio] [Moje zapisy Open Studio] [Zakończ rozmowę]';
 
   if (res.ok) {
     const waMessageId = res.data?.messages?.[0]?.id || null;
@@ -2247,6 +2851,15 @@ async function handleMainMenuInteractive({ client, m, sender }) {
       return true;
     }
 
+    if (id === 'menu_open_studio_bookings') {
+      await sendWhoOpenStudioBookingsMenu({
+        client,
+        to: m.from,
+        guardianUserId: sender.id
+      });
+      return true;
+    }
+
     if (id === 'menu_end') {
       await sendText({
         to: m.from,
@@ -2747,6 +3360,14 @@ app.post('/webhook', async (req, res) => {
 
             if (!handled) {
               handled = await handleWhoOpenStudioInteractive({ client, m, sender });
+            }
+
+            if (!handled) {
+              handled = await handleWhoOpenStudioBookingsInteractive({ client, m, sender });
+            }
+
+            if (!handled) {
+              handled = await handleOpenStudioBookingsInteractive({ client, m, sender });
             }
 
             if (!handled) {
