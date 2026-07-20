@@ -290,6 +290,8 @@ async function getUserChildren(client, guardianUserId) {
 // OPEN STUDIO
 // =========================
 
+const OPEN_STUDIO_SUPERUSER_INSTRUCTOR_ID = 10; // Marta
+
 async function canManageUser(client, actorUserId, targetUserId) {
   if (Number(actorUserId) === Number(targetUserId)) return true;
 
@@ -1355,6 +1357,223 @@ async function handleOpenStudioBookingsInteractive({ client, m, sender }) {
   return false;
 }
 
+async function sendInstructorOpenStudioSessionsMenu({ client, to, instructorId, offset = 0 }) {
+  const toNorm = normalizeTo(to);
+  const pageSize = 8;
+  const safeOffset = Math.max(0, Number(offset) || 0);
+
+  const { rows } = await client.query(
+    `
+    SELECT
+      s.id AS session_id,
+      s.session_date,
+      s.start_time,
+      s.end_time,
+      s.capacity,
+      i.first_name AS instructor_name,
+      COUNT(b.id) FILTER (WHERE b.status = 'booked')::int AS booked_count
+    FROM public.open_studio_sessions s
+    JOIN public.instructors i
+      ON i.id = s.instructor_id
+    LEFT JOIN public.open_studio_bookings b
+      ON b.session_id = s.id
+    WHERE ($1 = ${OPEN_STUDIO_SUPERUSER_INSTRUCTOR_ID} OR s.instructor_id = $1)
+      AND s.status <> 'cancelled'
+      AND (s.session_date + s.start_time)
+          > (now() AT TIME ZONE 'Europe/Warsaw')
+    GROUP BY
+      s.id,
+      s.session_date,
+      s.start_time,
+      s.end_time,
+      s.capacity,
+      i.first_name
+    ORDER BY s.session_date, s.start_time, s.id
+    LIMIT $2
+    OFFSET $3
+    `,
+    [instructorId, pageSize + 1, safeOffset]
+  );
+
+  const isOpenStudioSuperUser = Number(instructorId) === OPEN_STUDIO_SUPERUSER_INSTRUCTOR_ID;
+  const hasNextPage = rows.length > pageSize;
+  const sessions = rows.slice(0, pageSize);
+
+  if (!sessions.length) {
+    if (safeOffset > 0) {
+      return sendInstructorOpenStudioSessionsMenu({
+        client,
+        to: toNorm,
+        instructorId,
+        offset: Math.max(0, safeOffset - pageSize)
+      });
+    }
+
+    await sendText({
+      to: toNorm,
+      body: isOpenStudioSuperUser
+        ? 'Nie ma obecnie przyszłych zajęć Open Studio.'
+        : 'Nie masz obecnie przypisanych przyszłych zajęć Open Studio.'
+    });
+    return;
+  }
+
+  if (!WA_TOKEN || !WA_PHONE_ID) {
+    await auditOutbound({
+      userId: null,
+      to: toNorm,
+      body: 'INSTR_OPEN_STUDIO_SESSIONS (brak konfiguracji WhatsApp API)',
+      messageType: 'interactive_list',
+      status: 'skipped',
+      reason: 'missing_config'
+    });
+    return { ok: false, reason: 'missing_config' };
+  }
+
+  const listRows = sessions.map((session) => {
+    const { iso, month, day } = openStudioDateParts(session.session_date);
+    const weekday = openStudioWeekdayPl(iso);
+    const startTime = String(session.start_time || '').slice(0, 5);
+    const endTime = String(session.end_time || '').slice(0, 5);
+    const bookedCount = Number(session.booked_count) || 0;
+    const capacity = Number(session.capacity) || 0;
+
+    let title = `${weekday} ${day}/${month} ${startTime}`;
+    if (title.length > 24) title = title.slice(0, 24);
+
+    return {
+      id: `instr_os_session_${session.session_id}`,
+      title,
+      description: (isOpenStudioSuperUser
+        ? `Zapisy: ${bookedCount}/${capacity} • ${session.instructor_name}`
+        : `Zapisy: ${bookedCount}/${capacity} • ${startTime}-${endTime}`
+      ).slice(0, 72)
+    };
+  });
+
+  if (safeOffset > 0) {
+    listRows.push({
+      id: `instr_os_page_${Math.max(0, safeOffset - pageSize)}`,
+      title: '⬅️ Poprzednie terminy',
+      description: 'Wróć do wcześniejszych zajęć'
+    });
+  }
+
+  if (hasNextPage) {
+    listRows.push({
+      id: `instr_os_page_${safeOffset + pageSize}`,
+      title: '➡️ Kolejne terminy',
+      description: 'Pokaż dalsze zajęcia Open Studio'
+    });
+  }
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: toNorm,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      body: {
+        text: '🌞 Open Studio — wybierz zajęcia, aby sprawdzić listę zapisanych osób.'
+      },
+      action: {
+        button: 'Wybierz zajęcia',
+        sections: [
+          {
+            title: isOpenStudioSuperUser ? 'Wszystkie zajęcia' : 'Twoje zajęcia',
+            rows: listRows
+          }
+        ]
+      }
+    }
+  };
+
+  const res = await postWA({ phoneId: WA_PHONE_ID, payload });
+  const bodyLog = 'INSTR_OPEN_STUDIO_SESSIONS: ' + listRows.map((row) => row.title).join(' | ');
+  const waMessageId = res.data?.messages?.[0]?.id || null;
+
+  await auditOutbound({
+    userId: null,
+    to: toNorm,
+    body: bodyLog,
+    messageType: 'interactive_list',
+    status: res.ok ? 'sent' : 'error',
+    reason: res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed'),
+    waMessageId
+  });
+
+  return res;
+}
+
+async function sendInstructorOpenStudioParticipants({ client, to, instructorId, sessionId }) {
+  const toNorm = normalizeTo(to);
+
+  const sessionRes = await client.query(
+    `
+    SELECT
+      s.id,
+      to_char(s.session_date, 'DD/MM/YYYY') AS session_date_label,
+      to_char(s.start_time, 'HH24:MI') AS start_time_label,
+      to_char(s.end_time, 'HH24:MI') AS end_time_label,
+      s.capacity,
+      i.first_name AS instructor_name
+    FROM public.open_studio_sessions s
+    JOIN public.instructors i
+      ON i.id = s.instructor_id
+    WHERE s.id = $1
+      AND ($2 = ${OPEN_STUDIO_SUPERUSER_INSTRUCTOR_ID} OR s.instructor_id = $2)
+      AND s.status <> 'cancelled'
+    LIMIT 1
+    `,
+    [sessionId, instructorId]
+  );
+
+  const session = sessionRes.rows[0];
+
+  if (!session) {
+    await sendText({
+      to: toNorm,
+      body: 'Nie masz dostępu do wybranych zajęć Open Studio.'
+    });
+    return;
+  }
+
+  const { rows: participants } = await client.query(
+    `
+    SELECT
+      u.first_name,
+      COALESCE(u.last_name, '') AS last_name
+    FROM public.open_studio_bookings b
+    JOIN public.users u
+      ON u.id = b.user_id
+    WHERE b.session_id = $1
+      AND b.status = 'booked'
+    ORDER BY u.first_name, u.last_name, u.id
+    `,
+    [sessionId]
+  );
+
+  const isOpenStudioSuperUser = Number(instructorId) === OPEN_STUDIO_SUPERUSER_INSTRUCTOR_ID;
+
+  const header =
+    `🌞 Open Studio\n` +
+    `Termin: ${session.session_date_label} ${session.start_time_label}-${session.end_time_label}\n` +
+    (isOpenStudioSuperUser ? `Prowadząca: ${session.instructor_name}\n` : '') +
+    `Zapisy: ${participants.length}/${session.capacity}`;
+
+  const participantLines = participants.map((participant, index) => {
+    const fullName = `${participant.first_name || ''} ${participant.last_name || ''}`.trim();
+    return `${index + 1}. ${fullName || 'Uczestnik'}`;
+  });
+
+  await sendText({
+    to: toNorm,
+    body: participantLines.length
+      ? `${header}\n\n${participantLines.join('\n')}`
+      : `${header}\n\nBrak zapisanych osób.`
+  });
+}
+
 async function sendInstructorMenu({ to, instructorId }) {
   const toNorm = normalizeTo(to);
 
@@ -1370,6 +1589,53 @@ async function sendInstructorMenu({ to, instructorId }) {
     return;
   }
 
+  const regularSchedulePaused = isRegularSchedulePausedNow();
+
+  const instructorRows = [
+    {
+      id: 'instr_open_studio_bookings',
+      title: '🌞 Open Studio – zapisy',
+      description: 'Sprawdź listę uczestników'
+    },
+    ...(!regularSchedulePaused ? [
+      {
+        id: 'instr_today',
+        title: '📅 Zajęcia na dziś',
+        description: 'Plan Twoich grup na dzisiaj'
+      },
+      {
+        id: 'instr_tomorrow',
+        title: '📆 Zajęcia na jutro',
+        description: 'Plan Twoich grup na jutro'
+      },
+      {
+        id: 'instr_absences_7d',
+        title: '📝 Nieobecności 7 dni',
+        description: 'Kto odwoływał zajęcia'
+      },
+      {
+        id: 'instr_add_slot',
+        title: '➕ Dodaj wolne miejsce',
+        description: 'Otwórz dodatkowy slot'
+      },
+      {
+        id: 'instr_stats_7d',
+        title: '📊 Statystyki 7 dni',
+        description: 'Frekwencja i odrabiania'
+      },
+      {
+        id: 'instr_makeups_list',
+        title: '🔁 Odrabiania – lista',
+        description: 'Kto dopisał się na Twoje zajęcia'
+      }
+    ] : []),
+    {
+      id: 'instr_end',
+      title: '🏁 Zakończ',
+      description: 'Zakończ rozmowę'
+    }
+  ];
+
   const payload = {
     messaging_product: 'whatsapp',
     to: toNorm,
@@ -1384,43 +1650,7 @@ async function sendInstructorMenu({ to, instructorId }) {
         sections: [
           {
             title: 'Twoje narzędzia',
-            rows: [
-              {
-                id: 'instr_today',
-                title: '📅 Zajęcia na dziś',
-                description: 'Plan Twoich grup na dzisiaj'
-              },
-              {
-                id: 'instr_tomorrow',
-                title: '📆 Zajęcia na jutro',
-                description: 'Plan Twoich grup na jutro'
-              },
-              {
-                id: 'instr_absences_7d',
-                title: '📝 Nieobecności 7 dni',
-                description: 'Kto odwoływał zajęcia'
-              },
-              {
-                id: 'instr_add_slot',
-                title: '➕ Dodaj wolne miejsce',
-                description: 'Otwórz dodatkowy slot'
-              },
-              {
-                id: 'instr_stats_7d',
-                title: '📊 Statystyki 7 dni',
-                description: 'Frekwencja i odrabiania'
-              },
-              {
-                id: 'instr_makeups_list',
-                title: '🔁 Odrabiania – lista',
-                 description: 'Kto dopisał się na Twoje zajęcia'
-              },
-              {
-                id: 'instr_end',
-                title: '🏁 Zakończ',
-                description: 'Zakończ rozmowę'
-              }
-            ]
+            rows: instructorRows
           }
         ]
       }
@@ -1429,7 +1659,7 @@ async function sendInstructorMenu({ to, instructorId }) {
 
   const res = await postWA({ phoneId: WA_PHONE_ID, payload });
 
-  const bodyLog = 'INSTR_MENU: [today] [tomorrow] [absences_7d] [add_slot] [stats_7d] [end]';
+  const bodyLog = 'INSTR_MENU: ' + instructorRows.map((row) => `[${row.id}]`).join(' ');
   const waMessageId = res.data?.messages?.[0]?.id || null;
   const status = res.ok ? 'sent' : 'error';
   const reason = res.ok ? null : (res.status ? `http_${res.status}` : 'send_failed');
@@ -4370,6 +4600,47 @@ async function handleInstructorInteractive({ client, m, sender }) {
   // wybory z listy głównej
   if (itype === 'list_reply') {
     const id = m.interactive.list_reply?.id || '';
+
+    if (id === 'instr_open_studio_bookings') {
+      await sendInstructorOpenStudioSessionsMenu({
+        client,
+        to: m.from,
+        instructorId: sender.id,
+        offset: 0
+      });
+      return true;
+    }
+
+    if (id.startsWith('instr_os_page_')) {
+      const offset = Number(id.replace('instr_os_page_', '')) || 0;
+      await sendInstructorOpenStudioSessionsMenu({
+        client,
+        to: m.from,
+        instructorId: sender.id,
+        offset
+      });
+      return true;
+    }
+
+    if (id.startsWith('instr_os_session_')) {
+      const sessionId = Number(id.replace('instr_os_session_', '')) || 0;
+
+      if (!sessionId) {
+        await sendText({
+          to: m.from,
+          body: 'Nie udało się rozpoznać wybranych zajęć.'
+        });
+        return true;
+      }
+
+      await sendInstructorOpenStudioParticipants({
+        client,
+        to: m.from,
+        instructorId: sender.id,
+        sessionId
+      });
+      return true;
+    }
 
     if (id === 'instr_today') {
       await sendInstructorClassesForDay({ client, to: m.from, instructorId: sender.id, dayOffset: 0 });
