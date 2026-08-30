@@ -175,6 +175,14 @@ function isRegularSchedulePausedNow() {
 const REGULAR_SCHEDULE_PAUSE_MESSAGE =
   'W sierpniu regularne zajęcia są zawieszone. Zapraszamy do zapisów na Open Studio.';
 
+// TEMPORARY: set to false when the new-season schedule is ready.
+const PARKING_MODE_ENABLED = true;
+const PARKING_MESSAGE =
+  'Grafik na nowy sezon w przygotowaniu, system będzie dostępny wkrótce';
+
+// TEMPORARY: set to true to register the automatic cron jobs again.
+const SCHEDULED_TASKS_ENABLED = false;
+
 // =========================
 // DB HELPERS
 // =========================
@@ -3704,6 +3712,15 @@ app.post('/webhook', async (req, res) => {
           };
           await insertInboxRecord(client, rec);
 
+          if (PARKING_MODE_ENABLED) {
+            // Keep inbox logging, skip all booking/menu/instructor logic.
+            await sendText({
+              to: m.from,
+              body: PARKING_MESSAGE
+            });
+            continue;
+          }
+
           const sender = await resolveSenderType(client, m.from);
 
           let handled = false;
@@ -4702,7 +4719,7 @@ async function handleInstructorInteractive({ client, m, sender }) {
 // CRON JOBS
 // =========================
 
-if (WA_TOKEN && WA_PHONE_ID) {
+if (SCHEDULED_TASKS_ENABLED && WA_TOKEN && WA_PHONE_ID) {
   cron.schedule('30 10 * * 0', () => runWeeklySlotsJob(), {
     timezone: 'Europe/Warsaw'
   });
@@ -4721,6 +4738,8 @@ if (WA_TOKEN && WA_PHONE_ID) {
   });
 
   console.log('[CRON] Scheduled weekly_slots (Sun 10:30), absence_reminder (Sun 18:00), weekly_slots_broadcast (Sun 20:00), payment_reminder (22gi 18:00)');
+} else if (!SCHEDULED_TASKS_ENABLED) {
+  console.log('[CRON] All scheduled tasks are temporarily disabled');
 } else {
   console.log('[CRON] Skipping CRON scheduling (missing WA config)');
 }
